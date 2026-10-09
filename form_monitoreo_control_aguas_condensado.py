@@ -1,24 +1,21 @@
 import flet as ft
 import datetime
+import logging
+import math
 import threading
 import time
 import os
 import sys
 import unicodedata
+from uuid import uuid4
 
-# 🟢 Conexión a SQL Server
-try:
-    import conexion
-except ImportError:
-    conexion = None
+import conexionform
 
 
 def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-
+    base_path = getattr(
+        sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))
+    )
     return os.path.join(base_path, relative_path)
 
 
@@ -37,9 +34,6 @@ def limpiar_texto(texto):
 # CONSULTA DE ÚLTIMOS REGISTROS DESDE BD
 # ==================================================
 def obtener_ultimos_registros_bd():
-    if not conexion:
-        return {}
-
     query = """
     WITH UltimosRegistros AS (
         SELECT 
@@ -59,7 +53,7 @@ def obtener_ultimos_registros_bd():
     conn = None
     resultados = {}
     try:
-        conn = conexion.obtener_conexion()
+        conn = conexionform.obtener_conexion_formulario()
         cursor = conn.cursor()
         cursor.execute(query)
         filas = cursor.fetchall()
@@ -94,8 +88,10 @@ def obtener_ultimos_registros_bd():
                 },
             }
         cursor.close()
-    except Exception:
-        pass
+    except Exception as ex:
+        raise RuntimeError(
+            "No se pudieron cargar los últimos registros de SQL Server."
+        ) from ex
     finally:
         if conn:
             conn.close()
@@ -107,11 +103,8 @@ def obtener_ultimos_registros_bd():
 # INSERCIÓN EN BASE DE DATOS
 # ==================================================
 def insertar_registros_bd(
-    secciones_a_enviar, datos_sistema, usuario_logueado, texto_observaciones=""
+    registros_a_enviar, usuario_logueado, texto_observaciones=""
 ):
-    if not conexion:
-        return False, "No se encontró el módulo conexion.py en la carpeta."
-
     query = """
     INSERT INTO Registro_Monitoreo_Condensados_FMAN46 (
         fecha, hora, seccion, analizo, usuario_registro,
@@ -121,16 +114,19 @@ def insertar_registros_bd(
 
     conn = None
     try:
-        conn = conexion.obtener_conexion()
+        conn = conexionform.obtener_conexion_formulario()
         cursor = conn.cursor()
 
         def parse_float(val):
-            if not val or str(val).strip() == "" or str(val).strip() == "--":
+            if val is None or str(val).strip() in ("", "--"):
                 return None
             try:
-                return float(str(val).replace(",", ".").strip())
-            except ValueError:
-                return None
+                num = float(str(val).replace(",", ".").strip())
+            except ValueError as ex:
+                raise ValueError(f"Valor numérico no válido: {val!r}") from ex
+            if not math.isfinite(num):
+                raise ValueError(f"El valor numérico debe ser finito: {val!r}")
+            return num
 
         obs_a_guardar = (
             texto_observaciones.strip()
@@ -138,8 +134,7 @@ def insertar_registros_bd(
             else None
         )
 
-        for sec in secciones_a_enviar:
-            reg = datos_sistema[sec]
+        for reg in registros_a_enviar:
             vals = reg["valores"]
 
             v_ph = parse_float(vals.get("pH"))
@@ -154,7 +149,7 @@ def insertar_registros_bd(
                 query,
                 reg["fecha"],
                 reg["hora"],
-                sec,
+                reg["seccion"],
                 reg["analizo"],
                 usuario_logueado,
                 v_ph,
@@ -181,8 +176,9 @@ def insertar_registros_bd(
 
 def abrir_ventana(
     page: ft.Page,
-    usuario_logueado="Invitado",
-    nombre_completo="Invitado",
+    usuario_logueado: str,
+    nombre_completo: str,
+    on_logout=None,
 ):
     page.controls.clear()
 
@@ -204,7 +200,7 @@ def abrir_ventana(
     COLOR_FONDO = "#F8FAFC"
     COLOR_BORDE_DEFAULT = "#E2E8F0"
 
-    page.title = "Formulario 19 - Monitoreo de Condensados (FMAN-46)"
+    page.title = "Formulario 1 - Monitoreo de Condensados (FMAN-46)"
     page.bgcolor = COLOR_FONDO
     page.window.maximized = True
     page.window.resizable = True
@@ -286,11 +282,58 @@ def abrir_ventana(
         }
         for sec in configuracion_secciones
     }
+    registros_pendientes = []
+    ultimos_historicos = {}
 
     widgets_tarjetas = {}
 
+    def actualizar_resumen_seccion(seccion_nombre):
+        pendientes_seccion = [
+            registro
+            for registro in registros_pendientes
+            if registro["seccion"] == seccion_nombre
+        ]
+
+        if pendientes_seccion:
+            registro = pendientes_seccion[-1]
+            datos_sistema[seccion_nombre].update(
+                {
+                    "estado": "PENDIENTE",
+                    "hora": registro["hora"],
+                    "fecha": registro["fecha"],
+                    "analizo": registro["analizo"],
+                    "valores": registro["valores"].copy(),
+                }
+            )
+            return
+
+        historico = ultimos_historicos.get(limpiar_texto(seccion_nombre))
+        if historico:
+            datos_sistema[seccion_nombre].update(
+                {
+                    "estado": "ÚLTIMO REGISTRO",
+                    "hora": historico["hora"],
+                    "fecha": historico["fecha"],
+                    "analizo": historico["analizo"],
+                    "valores": historico["valores"].copy(),
+                }
+            )
+            return
+
+        datos_sistema[seccion_nombre].update(
+            {
+                "estado": "SIN_REGISTROS",
+                "hora": "",
+                "fecha": "",
+                "analizo": usuario_logueado,
+                "valores": {},
+            }
+        )
+
     def abrir_dialogo(dlg):
-        if hasattr(page, "open"):
+        if hasattr(page, "show_dialog"):
+            page.show_dialog(dlg)
+        elif hasattr(page, "open"):
             page.open(dlg)
         else:
             page.dialog = dlg
@@ -298,7 +341,9 @@ def abrir_ventana(
             page.update()
 
     def cerrar_dialogo(dlg=None):
-        if hasattr(page, "close") and dlg:
+        if hasattr(page, "pop_dialog") and dlg:
+            page.pop_dialog()
+        elif hasattr(page, "close") and dlg:
             page.close(dlg)
         elif page.dialog:
             page.dialog.open = False
@@ -317,7 +362,7 @@ def abrir_ventana(
         read_only=True,
         width=150,
         height=40,
-        content_padding=ft.padding.symmetric(horizontal=12, vertical=8),
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
         border_radius=8,
         border_color="#CBD5E1",
         text_size=13,
@@ -329,7 +374,7 @@ def abrir_ventana(
         read_only=True,
         width=130,
         height=40,
-        content_padding=ft.padding.symmetric(horizontal=12, vertical=8),
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
         border_radius=8,
         border_color="#CBD5E1",
         text_size=13,
@@ -414,8 +459,8 @@ def abrir_ventana(
     bar_fecha_hora = ft.Container(
         bgcolor="white",
         border_radius=12,
-        padding=ft.padding.symmetric(horizontal=24, vertical=16),
-        border=ft.border.all(1, COLOR_BORDE_DEFAULT),
+        padding=ft.Padding.symmetric(horizontal=24, vertical=16),
+        border=ft.Border.all(1, COLOR_BORDE_DEFAULT),
         content=ft.Row(
             [
                 ft.Column(
@@ -506,6 +551,7 @@ def abrir_ventana(
     )
 
     def actualizar_reloj():
+        nonlocal reloj_activo
         while reloj_activo:
             if page_lista:
                 try:
@@ -523,7 +569,9 @@ def abrir_ventana(
                     if not hora_fijada:
                         txt_input_hora.update()
                 except Exception:
-                    pass
+                    logging.exception("Se detuvo la actualización del reloj.")
+                    reloj_activo = False
+                    break
             time.sleep(1)
 
     threading.Thread(target=actualizar_reloj, daemon=True).start()
@@ -540,18 +588,19 @@ def abrir_ventana(
     )
 
     def animar_marquee():
+        nonlocal reloj_activo
         texto = (
-            f"💧 FMAN-46 MONITOREO DE CONDENSADOS • "
+            f" FMAN-46 MONITOREO DE CONDENSADOS • "
             f"          ✦                    "
-            f"🎨 CONDENSADO TINTORERÍA • "
+            f" CONDENSADO TINTORERÍA • "
             f"          ✦                    "
-            f"🔥 CONDENSADO RETORNO CALDERA • "
+            f" CONDENSADO RETORNO CALDERA • "
             f"          ✦                    "
-            f"👤 RESPONSABLE: {nombre_completo} • "
+            f" RESPONSABLE: {nombre_completo} • "
             f"          ✦                    "
-            f"🔑 USUARIO: {usuario_logueado} • "
+            f" USUARIO: {usuario_logueado} • "
             f"          ✦                    "
-            f"🏭 CRYSTAL S.A.S • "
+            f" CRYSTAL S.A.S • "
             f"          ✦                    "
         ) * 8
 
@@ -562,7 +611,9 @@ def abrir_ventana(
                     txt_marquee.value = texto
                     txt_marquee.update()
                 except Exception:
-                    pass
+                    logging.exception("Se detuvo la animación del encabezado.")
+                    reloj_activo = False
+                    break
             time.sleep(0.08)
 
     threading.Thread(target=animar_marquee, daemon=True).start()
@@ -570,15 +621,15 @@ def abrir_ventana(
     # ==================================================
     # LOGO
     # ==================================================
-    nombre_logo = "LOGO CRYSTAL PNG 1.png"
-    ruta_logo = resource_path(nombre_logo)
+    nombre_logo = "logo-crystal.png"
+    ruta_logo = resource_path(os.path.join("assets", nombre_logo))
 
     if os.path.exists(ruta_logo):
         img_logo = ft.Image(
-            src=f"/{nombre_logo}",
+            src=nombre_logo,
             width=180,
             height=60,
-            fit=ft.ImageFit.CONTAIN,
+            fit=ft.BoxFit.CONTAIN,
         )
     else:
         img_logo = ft.Text("LOGO CRYSTAL", color="red", weight=ft.FontWeight.BOLD)
@@ -631,13 +682,8 @@ def abrir_ventana(
             nonlocal reloj_activo
             cerrar_dialogo(dlg)
             reloj_activo = False
-            try:
-                import menu
-
-                page.controls.clear()
-                menu.crear_menu(page, usuario_logueado, nombre_completo)
-            except Exception:
-                page.window.close()
+            if on_logout is not None:
+                on_logout()
 
         abrir_dialogo(modal_salir)
 
@@ -671,7 +717,7 @@ def abrir_ventana(
                             bgcolor=COLOR_TITULO_BARRA,
                             border_radius=10,
                             padding=12,
-                            alignment=ft.alignment.center_left,
+                            alignment=ft.Alignment.CENTER_LEFT,
                             content=txt_marquee,
                         ),
                     ]
@@ -712,7 +758,7 @@ def abrir_ventana(
                                 ft.Container(
                                     padding=10,
                                     border_radius=8,
-                                    border=ft.border.all(1.5, COLOR_PRIMARIO),
+                                    border=ft.Border.all(1.5, COLOR_PRIMARIO),
                                     content=ft.Text(
                                         "FMAN-46",
                                         color=COLOR_PRIMARIO,
@@ -732,11 +778,24 @@ def abrir_ventana(
     # ==================================================
     # WIZARD DE REGISTRO / EDICIÓN TIPO SLIDE
     # ==================================================
-    def abrir_wizard_seccion(seccion_nombre, color_tema):
+    def abrir_wizard_seccion(seccion_nombre, color_tema, registro_id=None):
+        registro_existente = next(
+            (
+                registro
+                for registro in registros_pendientes
+                if registro["id"] == registro_id
+            ),
+            None,
+        )
+        if registro_id is not None and registro_existente is None:
+            raise ValueError(f"No existe el registro pendiente {registro_id}.")
+
         campos = configuracion_secciones[seccion_nombre]["campos"]
         total_campos = len(campos)
         indice_actual = 0
-        valores_temporales = datos_sistema[seccion_nombre]["valores"].copy()
+        valores_temporales = (
+            registro_existente["valores"].copy() if registro_existente else {}
+        )
 
         txt_num_paso = ft.Text("1", size=13, weight=ft.FontWeight.BOLD, color="white")
         badge_paso = ft.Container(
@@ -751,7 +810,7 @@ def abrir_ventana(
             ),
             bgcolor=COLOR_TITULO_BARRA,
             border_radius=8,
-            padding=ft.padding.symmetric(horizontal=10, vertical=5),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=5),
         )
 
         barra_progreso = ft.ProgressBar(
@@ -774,9 +833,9 @@ def abrir_ventana(
                 "", size=12, weight=ft.FontWeight.BOLD, color=COLOR_PRIMARIO
             ),
             bgcolor="white",
-            border=ft.border.all(1, "#CBD5E0"),
+            border=ft.Border.all(1, "#CBD5E0"),
             border_radius=6,
-            padding=ft.padding.symmetric(horizontal=10, vertical=4),
+            padding=ft.Padding.symmetric(horizontal=10, vertical=4),
         )
 
         txt_error_validacion = ft.Text(
@@ -797,7 +856,7 @@ def abrir_ventana(
             autofocus=True,
             border_color="#CBD5E0",
             focused_border_color=color_tema,
-            content_padding=ft.padding.symmetric(horizontal=18, vertical=16),
+            content_padding=ft.Padding.symmetric(horizontal=18, vertical=16),
             on_submit=lambda e: on_siguiente(None),
         )
 
@@ -807,7 +866,7 @@ def abrir_ventana(
             texto_limpio = texto.replace(",", ".").strip()
             try:
                 val = float(texto_limpio)
-                return val >= 0
+                return math.isfinite(val) and val >= 0
             except ValueError:
                 return False
 
@@ -845,7 +904,7 @@ def abrir_ventana(
             val = input_valor.value.strip()
             if val and not es_numero_valido(val):
                 txt_error_validacion.value = (
-                    "❌ No se permiten letras, símbolos ni números negativos."
+                    "Ingresa un número finito igual o mayor que cero."
                 )
                 txt_error_validacion.visible = True
                 dialog_modal.update()
@@ -877,19 +936,29 @@ def abrir_ventana(
             cerrar_dialogo(dialog_modal)
 
         def registrar_definitivamente():
-            datos_sistema[seccion_nombre]["estado"] = "PENDIENTE"
-            datos_sistema[seccion_nombre]["hora"] = obtener_hora_registro()
-            datos_sistema[seccion_nombre]["fecha"] = obtener_fecha_registro()
-            datos_sistema[seccion_nombre]["analizo"] = usuario_logueado
-            datos_sistema[seccion_nombre]["valores"] = valores_temporales.copy()
+            registro = {
+                "id": registro_existente["id"] if registro_existente else uuid4().hex,
+                "seccion": seccion_nombre,
+                "estado": "PENDIENTE",
+                "hora": obtener_hora_registro(),
+                "fecha": obtener_fecha_registro(),
+                "analizo": usuario_logueado,
+                "valores": valores_temporales.copy(),
+            }
+            if registro_existente:
+                registro_existente.update(registro)
+            else:
+                registros_pendientes.append(registro)
 
+            actualizar_resumen_seccion(seccion_nombre)
             actualizar_panel_datos(seccion_nombre)
             actualizar_tabla_automatica()
 
             cerrar_dialogo(dialog_modal)
             page.snack_bar = ft.SnackBar(
                 ft.Text(
-                    f"✓ Datos de {seccion_nombre} guardados en la tabla (Pendiente por Enviar)."
+                    f"✓ Registro de {seccion_nombre} guardado "
+                    "(Pendiente por Enviar)."
                 ),
                 bgcolor="#D97706",
             )
@@ -906,7 +975,7 @@ def abrir_ventana(
                         padding=12,
                         border_radius=10,
                         bgcolor="#FEF2F2",
-                        border=ft.border.all(1.5, "#FECACA"),
+                        border=ft.Border.all(1.5, "#FECACA"),
                         content=ft.Column(
                             [
                                 ft.Row(
@@ -936,7 +1005,7 @@ def abrir_ventana(
                                             ),
                                             bgcolor="#DC2626",
                                             border_radius=6,
-                                            padding=ft.padding.symmetric(
+                                            padding=ft.Padding.symmetric(
                                                 horizontal=8, vertical=3
                                             ),
                                         ),
@@ -1059,7 +1128,13 @@ def abrir_ventana(
                                     }
                                 )
                     except ValueError:
-                        pass
+                        aplicar_estado_paso(idx_c)
+                        txt_error_validacion.value = (
+                            f"El valor de {campo_nombre} no es numérico."
+                        )
+                        txt_error_validacion.visible = True
+                        dialog_modal.update()
+                        return
 
             if desviaciones:
                 mostrar_vista_desviacion(desviaciones)
@@ -1123,7 +1198,7 @@ def abrir_ventana(
                         padding=22,
                         border_radius=12,
                         bgcolor="#F8FAFC",
-                        border=ft.border.all(1.5, "#E2E8F0"),
+                        border=ft.Border.all(1.5, "#E2E8F0"),
                         content=ft.Column(
                             [
                                 ft.Row(
@@ -1137,7 +1212,7 @@ def abrir_ventana(
                                 txt_error_validacion,
                                 ft.Container(
                                     width=float("inf"),
-                                    alignment=ft.alignment.center,
+                                    alignment=ft.Alignment.CENTER,
                                     content=ft.Text(
                                         "💡 Presiona Enter para avanzar de parámetro rápidamente",
                                         size=11,
@@ -1175,7 +1250,7 @@ def abrir_ventana(
                         padding=12,
                         border_radius=10,
                         bgcolor="#FEF2F2",
-                        border=ft.border.all(1, "#FECACA"),
+                        border=ft.Border.all(1, "#FECACA"),
                         content=ft.Row(
                             [
                                 ft.Icon(
@@ -1229,7 +1304,7 @@ def abrir_ventana(
                 [
                     ft.Container(
                         bgcolor=COLOR_PRIMARIO,
-                        padding=ft.padding.symmetric(horizontal=20, vertical=16),
+                        padding=ft.Padding.symmetric(horizontal=20, vertical=16),
                         content=ft.Row(
                             [
                                 ft.Row(
@@ -1275,8 +1350,8 @@ def abrir_ventana(
     # ==================================================
     # MODAL: VER DATOS
     # ==================================================
-    def modal_ver_datos(seccion_nombre):
-        registro = datos_sistema[seccion_nombre]
+    def modal_ver_datos(registro):
+        seccion_nombre = registro["seccion"]
         cfg_sec = configuracion_secciones[seccion_nombre]
         campos = cfg_sec["campos"]
         color_sec = cfg_sec["color"]
@@ -1288,10 +1363,10 @@ def abrir_ventana(
 
             chips_lecturas.append(
                 ft.Container(
-                    padding=ft.padding.symmetric(horizontal=14, vertical=10),
+                    padding=ft.Padding.symmetric(horizontal=14, vertical=10),
                     border_radius=10,
                     bgcolor="#FFFFFF",
-                    border=ft.border.all(1.5, color_sec if hay_val else "#CBD5E1"),
+                    border=ft.Border.all(1.5, color_sec if hay_val else "#CBD5E1"),
                     content=ft.Row(
                         [
                             ft.Row(
@@ -1319,7 +1394,7 @@ def abrir_ventana(
                                 spacing=8,
                             ),
                             ft.Container(
-                                padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                                padding=ft.Padding.symmetric(horizontal=10, vertical=5),
                                 border_radius=6,
                                 bgcolor=color_sec if hay_val else "#F1F5F9",
                                 content=ft.Row(
@@ -1356,8 +1431,10 @@ def abrir_ventana(
                 [
                     ft.Container(
                         bgcolor=color_sec,
-                        padding=ft.padding.symmetric(horizontal=20, vertical=16),
-                        border_radius=ft.border_radius.only(top_left=14, top_right=14),
+                        padding=ft.Padding.symmetric(horizontal=20, vertical=16),
+                        border_radius=ft.BorderRadius.only(
+                            top_left=14, top_right=14
+                        ),
                         content=ft.Row(
                             [
                                 ft.Row(
@@ -1393,18 +1470,14 @@ def abrir_ventana(
                                 ),
                                 ft.Container(
                                     content=ft.Text(
-                                        registro["estado"],
+                                        "PENDIENTE POR ENVIAR",
                                         size=10,
                                         weight=ft.FontWeight.BOLD,
                                         color="white",
                                     ),
-                                    bgcolor=(
-                                        "#16A34A"
-                                        if registro["estado"] == "ÚLTIMO REGISTRO"
-                                        else "#B45309"
-                                    ),
+                                    bgcolor="#B45309",
                                     border_radius=6,
-                                    padding=ft.padding.symmetric(
+                                    padding=ft.Padding.symmetric(
                                         horizontal=8, vertical=4
                                     ),
                                 ),
@@ -1413,7 +1486,7 @@ def abrir_ventana(
                         ),
                     ),
                     ft.Container(
-                        padding=ft.padding.symmetric(horizontal=20, vertical=10),
+                        padding=ft.Padding.symmetric(horizontal=20, vertical=10),
                         bgcolor="#F1F5F9",
                         content=ft.Row(
                             [
@@ -1475,7 +1548,7 @@ def abrir_ventana(
                                                 shape=ft.RoundedRectangleBorder(
                                                     radius=8
                                                 ),
-                                                padding=ft.padding.symmetric(
+                                                padding=ft.Padding.symmetric(
                                                     horizontal=22, vertical=12
                                                 ),
                                             ),
@@ -1508,21 +1581,21 @@ def abrir_ventana(
     # ==================================================
     # ELIMINAR REGISTRO TEMPORAL
     # ==================================================
-    def eliminar_registro(seccion_nombre):
-        datos_sistema[seccion_nombre]["estado"] = "SIN_REGISTROS"
-        datos_sistema[seccion_nombre]["hora"] = ""
-        datos_sistema[seccion_nombre]["fecha"] = ""
-        datos_sistema[seccion_nombre]["valores"] = {}
+    def eliminar_registro(registro_id):
+        registro = next(
+            (
+                pendiente
+                for pendiente in registros_pendientes
+                if pendiente["id"] == registro_id
+            ),
+            None,
+        )
+        if registro is None:
+            return
 
-        ultimos = obtener_ultimos_registros_bd()
-        sec_limpia = limpiar_texto(seccion_nombre)
-        if sec_limpia in ultimos:
-            u = ultimos[sec_limpia]
-            datos_sistema[seccion_nombre]["estado"] = "ÚLTIMO REGISTRO"
-            datos_sistema[seccion_nombre]["hora"] = u["hora"]
-            datos_sistema[seccion_nombre]["fecha"] = u["fecha"]
-            datos_sistema[seccion_nombre]["analizo"] = u["analizo"]
-            datos_sistema[seccion_nombre]["valores"] = u["valores"].copy()
+        seccion_nombre = registro["seccion"]
+        registros_pendientes.remove(registro)
+        actualizar_resumen_seccion(seccion_nombre)
 
         actualizar_panel_datos(seccion_nombre)
         actualizar_tabla_automatica()
@@ -1574,7 +1647,9 @@ def abrir_ventana(
             try:
                 w["contenedor_raiz"].update()
             except Exception:
-                pass
+                logging.exception(
+                    "No se pudo actualizar la tarjeta de %s.", seccion_nombre
+                )
 
     # ==================================================
     # TABLA AUTOMÁTICA DE REGISTROS
@@ -1583,12 +1658,13 @@ def abrir_ventana(
 
     box_tabla_vacia = ft.Container(
         padding=30,
-        alignment=ft.alignment.center,
+        alignment=ft.Alignment.CENTER,
         content=ft.Row(
             [
                 ft.Icon(ft.Icons.INFO_OUTLINE, color="#94A3B8", size=22),
                 ft.Text(
-                    "Aún no has ingresado lecturas hoy. Haz clic en 'Ingresar Lecturas' en cualquiera de las 2 secciones.",
+                    "No hay registros pendientes por enviar. Haz clic en "
+                    "'Ingresar Lecturas' en cualquiera de las dos secciones.",
                     size=13,
                     color="#64748B",
                 ),
@@ -1601,8 +1677,8 @@ def abrir_ventana(
     header_tabla = ft.Container(
         bgcolor="#F8FAFC",
         border_radius=8,
-        padding=ft.padding.symmetric(horizontal=16, vertical=12),
-        border=ft.border.all(1, "#E2E8F0"),
+        padding=ft.Padding.symmetric(horizontal=16, vertical=12),
+        border=ft.Border.all(1, "#E2E8F0"),
         content=ft.Row(
             [
                 ft.Container(
@@ -1649,7 +1725,7 @@ def abrir_ventana(
                         size=12,
                     ),
                     expand=2,
-                    alignment=ft.alignment.center_right,
+                    alignment=ft.Alignment.CENTER_RIGHT,
                 ),
             ],
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -1661,7 +1737,8 @@ def abrir_ventana(
         hay_pendientes = False
         registros_visibles = 0
 
-        for sec, reg in datos_sistema.items():
+        for reg in registros_pendientes:
+            sec = reg["seccion"]
             if reg["estado"] == "PENDIENTE":
                 registros_visibles += 1
                 color_sec = configuracion_secciones[sec]["color"]
@@ -1676,28 +1753,28 @@ def abrir_ventana(
                     ),
                     bgcolor="#FEF3C7",
                     border_radius=6,
-                    padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                    padding=ft.Padding.symmetric(horizontal=8, vertical=4),
                 )
 
                 btn_ver = ft.IconButton(
                     icon=ft.Icons.VISIBILITY_ROUNDED,
                     icon_color=color_sec,
                     tooltip="Ver datos digitados",
-                    on_click=lambda ev, s=sec: modal_ver_datos(s),
+                    on_click=lambda ev, r=reg: modal_ver_datos(r),
                 )
                 btn_editar = ft.IconButton(
                     icon=ft.Icons.EDIT_ROUNDED,
                     icon_color="#2563EB",
                     tooltip="Editar en el slide",
-                    on_click=lambda ev, s=sec: abrir_wizard_seccion(
-                        s, configuracion_secciones[s]["color"]
+                    on_click=lambda ev, s=sec, rid=reg["id"]: abrir_wizard_seccion(
+                        s, configuracion_secciones[s]["color"], rid
                     ),
                 )
                 btn_eliminar = ft.IconButton(
                     icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
                     icon_color="#DC2626",
-                    tooltip="Eliminar registro",
-                    on_click=lambda ev, s=sec: eliminar_registro(s),
+                    tooltip="Eliminar registro pendiente",
+                    on_click=lambda ev, rid=reg["id"]: eliminar_registro(rid),
                 )
 
                 acciones = ft.Row(
@@ -1709,8 +1786,8 @@ def abrir_ventana(
                 fila_card = ft.Container(
                     bgcolor="white",
                     border_radius=8,
-                    padding=ft.padding.symmetric(horizontal=16, vertical=10),
-                    border=ft.border.all(1, "#E2E8F0"),
+                    padding=ft.Padding.symmetric(horizontal=16, vertical=10),
+                    border=ft.Border.all(1, "#E2E8F0"),
                     content=ft.Row(
                         [
                             ft.Container(
@@ -1751,7 +1828,7 @@ def abrir_ventana(
                             ft.Container(
                                 content=acciones,
                                 expand=2,
-                                alignment=ft.alignment.center_right,
+                                alignment=ft.Alignment.CENTER_RIGHT,
                             ),
                         ],
                         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -1768,7 +1845,7 @@ def abrir_ventana(
             try:
                 contenedor_tabla.update()
             except Exception:
-                pass
+                logging.exception("No se pudo actualizar la tabla de registros.")
 
     # ==================================================
     # MODAL DE OBSERVACIONES
@@ -1873,16 +1950,17 @@ def abrir_ventana(
     # MODAL DE ENVÍO FINAL
     # ==================================================
     def abrir_modal_envio_final():
-        secciones_a_enviar = [
-            sec for sec, reg in datos_sistema.items() if reg["estado"] == "PENDIENTE"
+        registros_a_enviar = [
+            {**registro, "valores": registro["valores"].copy()}
+            for registro in registros_pendientes
         ]
 
-        if not secciones_a_enviar:
+        if not registros_a_enviar:
             return
 
         tarjetas_desglose = []
-        for sec in secciones_a_enviar:
-            reg = datos_sistema[sec]
+        for reg in registros_a_enviar:
+            sec = reg["seccion"]
             cfg_sec = configuracion_secciones[sec]
             campos_sec = cfg_sec["campos"]
             color_sec = cfg_sec["color"]
@@ -1896,10 +1974,10 @@ def abrir_ventana(
                 if val_p and val_p != "--":
                     chips_valores.append(
                         ft.Container(
-                            padding=ft.padding.symmetric(horizontal=8, vertical=4),
+                            padding=ft.Padding.symmetric(horizontal=8, vertical=4),
                             border_radius=7,
                             bgcolor="#FFFFFF",
-                            border=ft.border.all(1.2, color_sec),
+                            border=ft.Border.all(1.2, color_sec),
                             content=ft.Row(
                                 [
                                     ft.Text(
@@ -1909,7 +1987,7 @@ def abrir_ventana(
                                         weight=ft.FontWeight.BOLD,
                                     ),
                                     ft.Container(
-                                        padding=ft.padding.symmetric(
+                                        padding=ft.Padding.symmetric(
                                             horizontal=6, vertical=2
                                         ),
                                         bgcolor=color_sec,
@@ -1936,7 +2014,7 @@ def abrir_ventana(
                     padding=10,
                     border_radius=10,
                     bgcolor="#FFFFFF",
-                    border=ft.border.all(1.5, color_sec),
+                    border=ft.Border.all(1.5, color_sec),
                     content=ft.Column(
                         [
                             ft.Row(
@@ -1971,7 +2049,7 @@ def abrir_ventana(
                                         ),
                                         bgcolor="#F1F5F9",
                                         border_radius=5,
-                                        padding=ft.padding.symmetric(
+                                        padding=ft.Padding.symmetric(
                                             horizontal=6, vertical=2
                                         ),
                                     ),
@@ -2003,10 +2081,10 @@ def abrir_ventana(
             )
 
         tarjeta_resumen_obs = ft.Container(
-            padding=ft.padding.symmetric(horizontal=12, vertical=8),
+            padding=ft.Padding.symmetric(horizontal=12, vertical=8),
             border_radius=8,
             bgcolor="#F8FAFC",
-            border=ft.border.all(1, "#CBD5E1"),
+            border=ft.Border.all(1, "#CBD5E1"),
             content=ft.Column(
                 [
                     ft.Row(
@@ -2064,7 +2142,7 @@ def abrir_ventana(
                             padding=10,
                             border_radius=8,
                             bgcolor="#FEF3C7",
-                            border=ft.border.all(1, "#FCD34D"),
+                            border=ft.Border.all(1, "#FCD34D"),
                             content=ft.Row(
                                 [
                                     ft.Icon(
@@ -2121,15 +2199,38 @@ def abrir_ventana(
             cerrar_dialogo(dlg)
 
             exito, mensaje = insertar_registros_bd(
-                secciones_a_enviar,
-                datos_sistema,
-                usuario_logueado,
-                observaciones_generales,
+                registros_a_enviar, usuario_logueado, observaciones_generales
             )
 
             if exito:
-                for sec in secciones_a_enviar:
-                    datos_sistema[sec]["estado"] = "ÚLTIMO REGISTRO"
+                ids_enviados = {registro["id"] for registro in registros_a_enviar}
+                secciones_enviadas = {
+                    registro["seccion"] for registro in registros_a_enviar
+                }
+                for registro in registros_a_enviar:
+                    clave_seccion = limpiar_texto(registro["seccion"])
+                    historico_actual = ultimos_historicos.get(clave_seccion)
+                    if not historico_actual or (
+                        registro["fecha"],
+                        registro["hora"],
+                    ) >= (
+                        historico_actual["fecha"],
+                        historico_actual["hora"],
+                    ):
+                        ultimos_historicos[clave_seccion] = {
+                            "fecha": registro["fecha"],
+                            "hora": registro["hora"],
+                            "analizo": registro["analizo"],
+                            "valores": registro["valores"].copy(),
+                        }
+
+                registros_pendientes[:] = [
+                    registro
+                    for registro in registros_pendientes
+                    if registro["id"] not in ids_enviados
+                ]
+                for sec in secciones_enviadas:
+                    actualizar_resumen_seccion(sec)
                     actualizar_panel_datos(sec)
 
                 actualizar_tabla_automatica()
@@ -2143,7 +2244,10 @@ def abrir_ventana(
                 btn_observaciones.update()
 
                 page.snack_bar = ft.SnackBar(
-                    ft.Text("✓ ¡Datos guardados exitosamente en SQL Server!"),
+                    ft.Text(
+                        f"✓ ¡{len(registros_a_enviar)} registro(s) guardado(s) "
+                        "exitosamente en SQL Server!"
+                    ),
                     bgcolor="#16A34A",
                 )
             else:
@@ -2174,7 +2278,7 @@ def abrir_ventana(
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
                 content=ft.Image(
                     src=ruta_web,
-                    fit=ft.ImageFit.COVER,
+                    fit=ft.BoxFit.COVER,
                     width=float("inf"),
                     height=160,
                 ),
@@ -2184,7 +2288,7 @@ def abrir_ventana(
                 height=160,
                 border_radius=10,
                 bgcolor=cfg["color_soft"],
-                border=ft.border.all(1, "#CBD5E1"),
+                border=ft.Border.all(1, "#CBD5E1"),
                 content=ft.Column(
                     [
                         ft.Icon(cfg["icono"], size=46, color=color_icono),
@@ -2199,7 +2303,7 @@ def abrir_ventana(
                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                     spacing=4,
                 ),
-                alignment=ft.alignment.center,
+                alignment=ft.Alignment.CENTER,
             )
 
         btn_ingresar = ft.ElevatedButton(
@@ -2216,7 +2320,7 @@ def abrir_ventana(
             style=ft.ButtonStyle(
                 bgcolor=COLOR_PRIMARIO,
                 shape=ft.RoundedRectangleBorder(radius=8),
-                padding=ft.padding.symmetric(vertical=13),
+                padding=ft.Padding.symmetric(vertical=13),
             ),
             on_click=lambda e: abrir_wizard_seccion(titulo, color_icono),
         )
@@ -2224,7 +2328,7 @@ def abrir_ventana(
         header_textos = ft.Container(
             width=float("inf"),
             height=46,
-            alignment=ft.alignment.center,
+            alignment=ft.Alignment.CENTER,
             content=ft.Column(
                 [
                     ft.Text(
@@ -2274,10 +2378,10 @@ def abrir_ventana(
 
             box_campo = ft.Container(
                 height=32,
-                padding=ft.padding.symmetric(horizontal=10, vertical=4),
+                padding=ft.Padding.symmetric(horizontal=10, vertical=4),
                 border_radius=7,
                 bgcolor="#F8FAFC",
-                border=ft.border.all(1, "#EDF2F7"),
+                border=ft.Border.all(1, "#EDF2F7"),
                 content=ft.Row(
                     [
                         ft.Text(
@@ -2353,16 +2457,16 @@ def abrir_ventana(
             bgcolor="white",
             border_radius=14,
             padding=18,
-            border=ft.border.all(1.5, COLOR_BORDE_DEFAULT),
+            border=ft.Border.all(1.5, COLOR_BORDE_DEFAULT),
             animate=ft.Animation(200, ft.AnimationCurve.EASE_OUT),
         )
 
         def on_hover(e):
             if e.data == "true":
-                card_container.border = ft.border.all(1.5, color_icono)
+                card_container.border = ft.Border.all(1.5, color_icono)
                 card_container.bgcolor = "#FAFCFF"
             else:
-                card_container.border = ft.border.all(1.5, COLOR_BORDE_DEFAULT)
+                card_container.border = ft.Border.all(1.5, COLOR_BORDE_DEFAULT)
                 card_container.bgcolor = "white"
             card_container.update()
 
@@ -2387,7 +2491,7 @@ def abrir_ventana(
                             ft.Icons.DASHBOARD_CUSTOMIZE_ROUNDED, color=COLOR_PRIMARIO
                         ),
                         ft.Text(
-                            "SECCIONES DE REGISTRO DIARIO (1 VEZ POR DÍA)",
+                            "SECCIONES DE REGISTRO DIARIO",
                             size=18,
                             weight=ft.FontWeight.BOLD,
                             color=COLOR_PRIMARIO,
@@ -2425,7 +2529,7 @@ def abrir_ventana(
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=8),
             side=ft.BorderSide(1.5, "#CBD5E1"),
-            padding=ft.padding.symmetric(horizontal=18, vertical=16),
+            padding=ft.Padding.symmetric(horizontal=18, vertical=16),
             bgcolor="white",
         ),
         tooltip="Añadir observaciones o notas sobre el turno antes de enviar",
@@ -2440,7 +2544,7 @@ def abrir_ventana(
         disabled=True,
         style=ft.ButtonStyle(
             shape=ft.RoundedRectangleBorder(radius=8),
-            padding=ft.padding.symmetric(horizontal=24, vertical=16),
+            padding=ft.Padding.symmetric(horizontal=24, vertical=16),
         ),
         on_click=lambda e: abrir_modal_envio_final(),
     )
@@ -2459,7 +2563,7 @@ def abrir_ventana(
                                     ft.Icons.TABLE_CHART_ROUNDED, color=COLOR_PRIMARIO
                                 ),
                                 ft.Text(
-                                    "TABLA AUTOMÁTICA DE REGISTROS DEL DÍA",
+                                    "TABLA AUTOMÁTICA DE REGISTROS PENDIENTES",
                                     size=18,
                                     weight=ft.FontWeight.BOLD,
                                     color=COLOR_PRIMARIO,
@@ -2471,7 +2575,7 @@ def abrir_ventana(
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                 ),
                 ft.Text(
-                    "Aquí se listan automáticamente las secciones completadas pendientes por enviar a la base de datos.",
+                    "Aquí aparecen los registros completados que aún no se han enviado a la base de datos.",
                     color="#64748B",
                     size=13,
                 ),
@@ -2512,16 +2616,22 @@ def abrir_ventana(
     page_lista = True
 
     # 🟢 Carga directa comprobando variaciones ortográficas
-    ultimos_historicos = obtener_ultimos_registros_bd()
+    try:
+        ultimos_historicos = obtener_ultimos_registros_bd()
+    except RuntimeError:
+        logging.exception("No fue posible cargar el historial de condensados FMAN-46.")
+        ultimos_historicos = {}
+        page.snack_bar = ft.SnackBar(
+            ft.Text(
+                "No se pudieron cargar los últimos registros. "
+                "Verifica la conexión a SQL Server."
+            ),
+            bgcolor="#B91C1C",
+        )
+        page.snack_bar.open = True
+        page.update()
     for sec_nom in configuracion_secciones:
-        sec_normalizada = limpiar_texto(sec_nom)
-        if sec_normalizada in ultimos_historicos:
-            h = ultimos_historicos[sec_normalizada]
-            datos_sistema[sec_nom]["estado"] = "ÚLTIMO REGISTRO"
-            datos_sistema[sec_nom]["hora"] = h["hora"]
-            datos_sistema[sec_nom]["fecha"] = h["fecha"]
-            datos_sistema[sec_nom]["analizo"] = h["analizo"]
-            datos_sistema[sec_nom]["valores"] = h["valores"].copy()
+        actualizar_resumen_seccion(sec_nom)
         actualizar_panel_datos(sec_nom)
 
     actualizar_tabla_automatica()
