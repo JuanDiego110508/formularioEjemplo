@@ -13,7 +13,7 @@ RUTA_LOGO = "logo-crystal.png"
 
 
 def tiene_permiso_formulario_2(reportes_autorizados: frozenset[str]) -> bool:
-    return login.REPORTE_FORMULARIO_20 in reportes_autorizados
+    return login.REPORTE_FORMULARIO_2 in reportes_autorizados
 
 
 def tiene_permiso_formulario_3(reportes_autorizados: frozenset[str]) -> bool:
@@ -74,7 +74,7 @@ def crear_menu(
         cerrar_dialogo(dialogo)
         on_logout()
 
-    def abrir_formulario_1(_):
+    def abrir_formulario_19(_):
         import form_monitoreo_control_aguas_condensado as formulario_19
 
         formulario_19.abrir_ventana(
@@ -93,9 +93,9 @@ def crear_menu(
             page.update()
             return
 
-        import form_monitoreo_control_aguas_caldera as formulario_20
+        import form_monitoreo_control_aguas_caldera as formulario_2
 
-        formulario_20.abrir_ventana(
+        formulario_2.abrir_ventana(
             page,
             usuario,
             nombre,
@@ -147,7 +147,7 @@ def crear_menu(
             "icono": ft.Icons.WATER_DROP_OUTLINED,
             "disponible": login.REPORTE_FORMULARIO_19 in reportes_autorizados,
             "implementado": True,
-            "on_click": abrir_formulario_1,
+            "on_click": abrir_formulario_19,
         },
         {
             "numero": "2",

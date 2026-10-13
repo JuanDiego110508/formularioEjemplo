@@ -1214,7 +1214,7 @@ def abrir_ventana(
                                     width=float("inf"),
                                     alignment=ft.Alignment.CENTER,
                                     content=ft.Text(
-                                        "💡 Presiona Enter para avanzar de parámetro rápidamente",
+                                        " Presiona Enter para avanzar de parámetro rápidamente",
                                         size=11,
                                         color="#64748B",
                                         text_align=ft.TextAlign.CENTER,
@@ -1601,7 +1601,7 @@ def abrir_ventana(
         actualizar_tabla_automatica()
 
         page.snack_bar = ft.SnackBar(
-            ft.Text(f"🗑️ Registro pendiente de {seccion_nombre} eliminado."),
+            ft.Text(f" Registro pendiente de {seccion_nombre} eliminado."),
             bgcolor="#DC2626",
         )
         page.snack_bar.open = True
@@ -2252,7 +2252,7 @@ def abrir_ventana(
                 )
             else:
                 page.snack_bar = ft.SnackBar(
-                    ft.Text(f"❌ {mensaje}"),
+                    ft.Text(f" {mensaje}"),
                     bgcolor="#DC2626",
                 )
 

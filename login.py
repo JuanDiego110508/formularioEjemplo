@@ -7,8 +7,9 @@ import conexion
 
 
 REPORTE_FORMULARIO_19 = "mante_condensados"
-REPORTE_FORMULARIO_20 = "mante_aguas_caldera"
+REPORTE_FORMULARIO_2 = "mante_aguas_caldera"
 REPORTE_FORMULARIO_3 = "mante_control_caldera"
+REPORTE_FORMULARIO_4 = "mante_control_agua_soda"
 CONSULTA_USUARIO = """
 SELECT usuario, nombre, reporte
 FROM dbo.Maestro_Permisos_Reportes
@@ -33,8 +34,9 @@ def autenticar_usuario(
                 usuario,
                 contraseña,
                 REPORTE_FORMULARIO_19,
-                REPORTE_FORMULARIO_20,
+                REPORTE_FORMULARIO_2,
                 REPORTE_FORMULARIO_3,
+                REPORTE_FORMULARIO_4,
             )
             filas = cursor.fetchall()
         finally:
