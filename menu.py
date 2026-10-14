@@ -15,9 +15,11 @@ RUTA_LOGO = "logo-crystal.png"
 def tiene_permiso_formulario_2(reportes_autorizados: frozenset[str]) -> bool:
     return login.REPORTE_FORMULARIO_2 in reportes_autorizados
 
-
 def tiene_permiso_formulario_3(reportes_autorizados: frozenset[str]) -> bool:
     return login.REPORTE_FORMULARIO_3 in reportes_autorizados
+
+def tiene_permiso_formulario_4(reportes_autorizados: frozenset[str]) -> bool:
+    return login.REPORTE_FORMULARIO_4 in reportes_autorizados
 
 
 def crear_menu(
@@ -120,6 +122,25 @@ def crear_menu(
             volver_al_menu,
         )
 
+    def abrir_formulario_4(_):
+        if not tiene_permiso_formulario_4(reportes_autorizados):
+            page.snack_bar = ft.SnackBar(ft.Text(
+                    "No tienes autorización para abrir el Formulario 4."
+                )
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        import form_control_agua_soda_lavador_gases as formulario_4
+
+        formulario_4.abrir_ventana(
+            page,
+            usuario,
+            nombre,
+            volver_al_menu,
+        )
+
     ruta_logo = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "assets", RUTA_LOGO
     )
@@ -170,10 +191,11 @@ def crear_menu(
         {
             "numero": "4",
             "titulo": "Formulario 4",
-            "descripcion": "Próximamente disponible.",
+            "descripcion": "Control consumo de agua y soda caustica lavador de gases caldera - 22F-010",
             "icono": ft.Icons.PRECISION_MANUFACTURING_OUTLINED,
-            "disponible": False,
-            "implementado": False,
+            "disponible": tiene_permiso_formulario_4(reportes_autorizados),
+            "implementado": True,
+            "on_click": abrir_formulario_4,
         },
     ]
 

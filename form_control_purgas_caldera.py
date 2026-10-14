@@ -3,7 +3,9 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from uuid import uuid4
 
 import flet as ft
 import pyodbc
@@ -11,13 +13,22 @@ import pyodbc
 import conexionform
 
 
+# ============================================================
+# FORMULARIO 3 - CONTROL DE PURGAS DE CALDERA
+# Sin turnos, entrega ni recibe.
+# Los registros se guardan primero como borradores locales.
+# ============================================================
+
 TABLA_REGISTRO = "dbo.Registro_Control_Purgas_Caldera"
-TURNOS = (1, 2, 3)
 CALDERAS = (1, 2)
+
 COLOR_PRIMARIO = "#1E3A8A"
 COLOR_TITULO = "#0F172A"
+COLOR_FONDO = "#F8FAFC"
 COLOR_BORDE = "#E2E8F0"
-COLOR_TURNO = {1: "#0284C7", 2: "#EA580C", 3: "#7C3AED"}
+COLOR_EXITO = "#15803D"
+COLOR_ERROR = "#B91C1C"
+COLOR_ALERTA = "#D97706"
 
 COLUMNAS_POR_CALDERA = {
     caldera: (
@@ -28,12 +39,20 @@ COLUMNAS_POR_CALDERA = {
     )
     for caldera in CALDERAS
 }
-COLUMNAS_TURNO = tuple(
+
+COLUMNAS_MEDICION = tuple(
     columna
     for caldera in CALDERAS
     for columna in COLUMNAS_POR_CALDERA[caldera]
 )
-COLUMNAS_REGISTRO = (*COLUMNAS_TURNO, "entrega", "recibe", "usuario_registro")
+
+COLUMNAS_REGISTRO = (
+    "fecha",
+    "hora",
+    *COLUMNAS_MEDICION,
+    "usuario_registro",
+)
+
 CAMPOS_NUMERICOS = frozenset(
     columna
     for caldera in CALDERAS
@@ -45,38 +64,48 @@ CAMPOS_NUMERICOS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class BorradorRegistro:
+    id_temporal: str
+    fecha: str
+    hora: str
+    usuario_registro: str
+    valores: dict[str, object]
+    observaciones: str = ""
+
+
 def parsear_valor_numerico(texto: str, nombre: str) -> Decimal:
-    texto = texto.strip().replace(",", ".")
-    if not texto:
+    texto_normalizado = (texto or "").strip().replace(",", ".")
+
+    if not texto_normalizado:
         raise ValueError(f"Completa el valor de {nombre}.")
-    if any(caracter not in "0123456789." for caracter in texto):
+    if texto_normalizado.count(".") > 1:
+        raise ValueError(f"{nombre} tiene un formato decimal inválido.")
+    if any(caracter not in "0123456789." for caracter in texto_normalizado):
         raise ValueError(f"{nombre} debe ser un número positivo.")
 
     try:
-        valor = Decimal(texto)
+        valor = Decimal(texto_normalizado)
     except InvalidOperation as ex:
         raise ValueError(f"{nombre} debe ser un número válido.") from ex
 
     if not valor.is_finite() or valor < 0:
         raise ValueError(f"{nombre} debe ser un número positivo.")
-    if len(texto.split(".")) > 2:
-        raise ValueError(f"{nombre} tiene un formato decimal inválido.")
-    decimales = len(texto.partition(".")[2])
-    if decimales > 2:
+
+    parte_entera, _, parte_decimal = texto_normalizado.partition(".")
+    if len(parte_decimal) > 2:
         raise ValueError(f"{nombre} admite máximo dos decimales.")
-    digitos_enteros = len(texto.partition(".")[0].lstrip("0"))
-    if digitos_enteros > 8:
+    if len(parte_entera.lstrip("0")) > 8:
         raise ValueError(f"{nombre} admite máximo ocho dígitos enteros.")
+
     return valor
 
 
-def validar_turno(turno: int, campos: dict[str, str]) -> dict[str, object]:
-    if turno not in TURNOS:
-        raise ValueError("Selecciona un turno válido (1, 2 o 3).")
-
+def validar_registro(campos: dict[str, str]) -> dict[str, object]:
     valores: dict[str, object] = {}
+
     for caldera in CALDERAS:
-        for campo, etiqueta in (
+        definiciones = (
             (f"purga_{caldera}_ph", f"pH de caldera #{caldera}"),
             (
                 f"purga_{caldera}_alcalinidad_m",
@@ -84,8 +113,10 @@ def validar_turno(turno: int, campos: dict[str, str]) -> dict[str, object]:
             ),
             (f"purga_{caldera}_color", f"Color de caldera #{caldera}"),
             (f"purga_{caldera}_soda_g", f"Soda de caldera #{caldera}"),
-        ):
-            entrada = campos.get(campo, "").strip()
+        )
+
+        for campo, etiqueta in definiciones:
+            entrada = (campos.get(campo) or "").strip()
             if campo in CAMPOS_NUMERICOS:
                 valores[campo] = parsear_valor_numerico(entrada, etiqueta)
             else:
@@ -95,114 +126,83 @@ def validar_turno(turno: int, campos: dict[str, str]) -> dict[str, object]:
                     raise ValueError(f"{etiqueta} admite máximo 50 caracteres.")
                 valores[campo] = entrada
 
-    for campo, etiqueta in (("entrega", "Entrega"), ("recibe", "Recibe")):
-        nombre = campos.get(campo, "").strip()
-        if not nombre:
-            raise ValueError(f"Completa el nombre de {etiqueta}.")
-        if len(nombre) > 100:
-            raise ValueError(f"El nombre de {etiqueta} admite máximo 100 caracteres.")
-        valores[campo] = nombre
-
     return valores
 
 
 def obtener_desviaciones(valores: dict[str, object]) -> list[str]:
-    desviaciones = []
+    desviaciones: list[str] = []
+
     for caldera in CALDERAS:
         ph = valores[f"purga_{caldera}_ph"]
         alcalinidad = valores[f"purga_{caldera}_alcalinidad_m"]
+
+        if not isinstance(ph, Decimal) or not isinstance(alcalinidad, Decimal):
+            raise ValueError("Los valores numéricos del registro no son válidos.")
+
         if ph < Decimal("10.5") or ph > Decimal("11.5"):
             desviaciones.append(
-                f"Caldera #{caldera} · pH {ph} (control 10,5–11,5)"
+                f"Caldera #{caldera}: pH {ph} (control 10,5 a 11,5)."
             )
         if alcalinidad > Decimal("500"):
             desviaciones.append(
-                f"Caldera #{caldera} · Alcalinidad M {alcalinidad} "
-                "(máximo 500 ppm)"
+                f"Caldera #{caldera}: Alcalinidad M {alcalinidad} "
+                "(máximo 500 ppm)."
             )
+
     return desviaciones
 
 
-def insertar_borradores_bd(
-    fecha: str,
-    usuario_registro: str,
-    borradores: list[dict[str, object]],
-) -> list[int]:
+def validar_borrador_para_bd(borrador: BorradorRegistro) -> tuple[datetime.date, datetime.time, dict[str, object], str]:
     try:
-        fecha_sql = datetime.date.fromisoformat(fecha)
+        fecha_sql = datetime.date.fromisoformat(borrador.fecha)
+        hora_sql = datetime.time.fromisoformat(borrador.hora)
     except ValueError as ex:
-        raise ValueError("La fecha no tiene un formato válido.") from ex
-    usuario_registro = usuario_registro.strip()
-    if not usuario_registro or len(usuario_registro) > 100:
-        raise ValueError("El usuario de registro debe tener entre 1 y 100 caracteres.")
-    if not borradores:
-        raise ValueError("Selecciona al menos un turno para enviar.")
+        raise ValueError("La fecha o la hora del borrador no son válidas.") from ex
 
-    turnos = [borrador.get("turno") for borrador in borradores]
-    if (
-        any(turno not in TURNOS for turno in turnos)
-        or len(set(turnos)) != len(turnos)
-    ):
-        raise ValueError("Los borradores deben contener turnos válidos y únicos.")
-
-    valores_borradores = []
-    for borrador in borradores:
-        if borrador.get("fecha") != fecha_sql.isoformat():
-            raise ValueError(
-                "Los borradores seleccionados deben corresponder a la fecha "
-                "que se va a guardar."
-            )
-        try:
-            hora_sql = datetime.time.fromisoformat(str(borrador.get("hora", "")))
-        except ValueError as ex:
-            raise ValueError("La hora de operación no tiene un formato válido.") from ex
-        valores = borrador.get("valores")
-        if not isinstance(valores, dict):
-            raise ValueError("El borrador no contiene valores válidos.")
-        valores_validados = validar_turno(
-            int(borrador["turno"]),
-            {campo: str(valor) for campo, valor in valores.items()},
+    usuario_limpio = (borrador.usuario_registro or "").strip()
+    if not usuario_limpio or len(usuario_limpio) > 100:
+        raise ValueError(
+            "El usuario de registro debe tener entre 1 y 100 caracteres."
         )
-        valores_borradores.append((hora_sql, valores_validados))
+
+    valores_validados = validar_registro(
+        {
+            campo: str(borrador.valores.get(campo, ""))
+            for campo in COLUMNAS_MEDICION
+        }
+    )
+    return fecha_sql, hora_sql, valores_validados, usuario_limpio
+
+
+def insertar_borradores_bd(borradores: list[BorradorRegistro]) -> list[int]:
+    if not borradores:
+        raise ValueError("No hay borradores seleccionados para enviar.")
+
+    ids_temporales = [borrador.id_temporal for borrador in borradores]
+    if len(ids_temporales) != len(set(ids_temporales)):
+        raise ValueError("La selección contiene borradores duplicados.")
+
+    registros_validados = [
+        validar_borrador_para_bd(borrador) for borrador in borradores
+    ]
+
+    columnas_sql = ", ".join(COLUMNAS_REGISTRO)
+    placeholders = ", ".join("?" for _ in COLUMNAS_REGISTRO)
 
     conn = None
     cursor = None
+    ids: list[int] = []
+
     try:
         conn = conexionform.obtener_conexion_formulario()
         cursor = conn.cursor()
-        marcadores = ", ".join("?" for _ in turnos)
-        cursor.execute(
-            f"""
-            SELECT turno
-            FROM {TABLA_REGISTRO} WITH (UPDLOCK, HOLDLOCK)
-            WHERE fecha = ? AND turno IN ({marcadores})
-            """,
-            fecha_sql.isoformat(),
-            *turnos,
-        )
-        existentes = {int(fila[0]) for fila in cursor.fetchall()}
-        if existentes:
-            turnos_existentes = ", ".join(
-                str(turno) for turno in sorted(existentes)
-            )
-            raise ValueError(
-                f"Ya existe un registro para el turno {turnos_existentes} "
-                f"en la fecha {fecha_sql.isoformat()}."
-            )
 
-        columnas = ("fecha", "hora", "turno", *COLUMNAS_REGISTRO)
-        columnas_sql = ", ".join(columnas)
-        placeholders = ", ".join("?" for _ in columnas)
-        ids = []
-        for borrador, (hora_sql, valores) in zip(borradores, valores_borradores):
+        for fecha_sql, hora_sql, valores, usuario in registros_validados:
             parametros = (
                 fecha_sql.isoformat(),
                 hora_sql.strftime("%H:%M:%S"),
-                int(borrador["turno"]),
-                *(valores[columna] for columna in COLUMNAS_TURNO),
-                valores["entrega"],
-                valores["recibe"],
-                usuario_registro,
+                *(valores[columna] for columna in COLUMNAS_MEDICION),
+                usuario,
             )
             cursor.execute(
                 f"""
@@ -215,16 +215,18 @@ def insertar_borradores_bd(
             fila = cursor.fetchone()
             if fila is None:
                 raise RuntimeError(
-                    "SQL Server no devolvió el identificador del registro."
+                    "SQL Server no devolvió el identificador de un registro."
                 )
             ids.append(int(fila[0]))
 
         conn.commit()
         return ids
+
     except Exception:
         if conn is not None:
             conn.rollback()
         raise
+
     finally:
         if cursor is not None:
             cursor.close()
@@ -240,118 +242,103 @@ def abrir_ventana(
 ):
     page.controls.clear()
     page.title = "Formulario 3 - Control de purgas de caldera"
-    page.bgcolor = "#F8FAFC"
+    page.bgcolor = COLOR_FONDO
 
     formulario_activo = True
-    page.on_disconnect = lambda _: detener_formulario()
+    interfaz_lista = False
+    fecha_fijada: str | None = None
+    hora_fijada: str | None = None
+    id_borrador_en_edicion: str | None = None
+
+    borradores: list[BorradorRegistro] = []
+    selecciones: dict[str, ft.Checkbox] = {}
 
     def detener_formulario():
         nonlocal formulario_activo
         formulario_activo = False
 
-    ahora = datetime.datetime.now()
-    fecha_seleccionada = ahora.date().isoformat()
-    hora_seleccionada = ahora.strftime("%H:%M:%S")
-    fecha_fijada = None
-    hora_fijada = None
-    campo_fecha = ft.TextField(
-        value=fecha_seleccionada,
-        read_only=True,
-        width=160,
-        border_radius=8,
-        border_color="#CBD5E1",
-        text_size=13,
-        text_style=ft.TextStyle(weight=ft.FontWeight.W_500),
-    )
-    campo_hora = ft.TextField(
-        value=hora_seleccionada,
-        read_only=True,
-        width=130,
-        border_radius=8,
-        border_color="#CBD5E1",
-        text_size=13,
-        text_style=ft.TextStyle(weight=ft.FontWeight.W_500),
-    )
-    borradores: dict[tuple[str, int], dict[str, object]] = {}
-    selecciones: dict[tuple[str, int], ft.Checkbox] = {}
-    borrador_en_edicion: dict[int, tuple[str, int]] = {}
-    estados_turno: dict[int, ft.Text] = {}
-    campos_turno: dict[int, dict[str, ft.TextField]] = {}
-    columna_borradores = ft.Column(spacing=8)
-    estado_vacio = ft.Container(
-        padding=14,
-        bgcolor="#F8FAFC",
-        border=ft.Border.all(1, COLOR_BORDE),
-        border_radius=9,
-        content=ft.Text(
-            "Aún no hay borradores. Guarda cada turno para revisarlo y enviarlo.",
-            size=13,
-            color="#475569",
-        ),
-    )
-    mensaje_estado = ft.Text("", visible=False, size=13)
-    boton_enviar = ft.ElevatedButton(
-        "Enviar turnos seleccionados",
-        icon=ft.Icons.SEND_ROUNDED,
-        bgcolor=COLOR_PRIMARIO,
-        color="white",
-        disabled=True,
-    )
+    page.on_disconnect = lambda _: detener_formulario()
 
     def mostrar_dialogo(dialogo):
         if hasattr(page, "show_dialog"):
             page.show_dialog(dialogo)
-        else:
+        elif hasattr(page, "open"):
             page.open(dialogo)
+        else:
+            page.dialog = dialogo
+            dialogo.open = True
+            page.update()
 
     def cerrar_dialogo(dialogo):
         if hasattr(page, "pop_dialog"):
             page.pop_dialog()
         elif hasattr(page, "close"):
             page.close(dialogo)
-        elif page.dialog is not None:
+        elif getattr(page, "dialog", None) is not None:
             page.dialog.open = False
             page.update()
 
+    def mostrar_mensaje(texto: str, color: str):
+        mensaje_estado.value = texto
+        mensaje_estado.color = color
+        mensaje_estado.visible = True
+        page.update()
+
+    ahora = datetime.datetime.now()
+
+    campo_fecha = ft.TextField(
+        value=ahora.date().isoformat(), read_only=True, width=160, height=45,
+        border_radius=8, border_color="#CBD5E1", text_size=13,
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+    )
+    campo_hora = ft.TextField(
+        value=ahora.strftime("%H:%M:%S"), read_only=True, width=130, height=45,
+        border_radius=8, border_color="#CBD5E1", text_size=13,
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+    )
+    txt_reloj = ft.Text(
+        ahora.strftime("%H:%M:%S"),
+        size=18,
+        weight=ft.FontWeight.BOLD,
+        color=COLOR_PRIMARIO,
+    )
+
+    def obtener_fecha() -> str:
+        return fecha_fijada or datetime.datetime.now().date().isoformat()
+
+    def obtener_hora() -> str:
+        return hora_fijada or datetime.datetime.now().strftime("%H:%M:%S")
+
     def cambiar_fecha(_):
-        nonlocal fecha_fijada, fecha_seleccionada
+        nonlocal fecha_fijada
         if selector_fecha.value:
             fecha_fijada = selector_fecha.value.strftime("%Y-%m-%d")
-            fecha_seleccionada = fecha_fijada
-            campo_fecha.value = fecha_seleccionada
+            campo_fecha.value = fecha_fijada
             boton_ahora.visible = True
             page.update()
 
     def cambiar_hora(_):
-        nonlocal hora_fijada, hora_seleccionada
+        nonlocal hora_fijada
         if selector_hora.value:
             hora_fijada = selector_hora.value.strftime("%H:%M:%S")
-            hora_seleccionada = hora_fijada
-            campo_hora.value = hora_seleccionada
+            campo_hora.value = hora_fijada
             boton_ahora.visible = True
             page.update()
 
     selector_fecha = ft.DatePicker(
         value=datetime.datetime.combine(ahora.date(), datetime.time.min),
-        first_date=datetime.datetime(2000, 1, 1),
-        last_date=ahora,
-        current_date=ahora,
-        on_change=cambiar_fecha,
+        first_date=datetime.datetime(2000, 1, 1), last_date=ahora,
+        current_date=ahora, on_change=cambiar_fecha,
     )
-    selector_hora = ft.TimePicker(
-        value=ahora.time(),
-        on_change=cambiar_hora,
-    )
+    selector_hora = ft.TimePicker(value=ahora.time(), on_change=cambiar_hora)
 
     def establecer_ahora(_):
-        nonlocal fecha_fijada, fecha_seleccionada, hora_fijada, hora_seleccionada
+        nonlocal fecha_fijada, hora_fijada
         fecha_fijada = None
         hora_fijada = None
         momento = datetime.datetime.now()
-        fecha_seleccionada = momento.date().isoformat()
-        hora_seleccionada = momento.strftime("%H:%M:%S")
-        campo_fecha.value = fecha_seleccionada
-        campo_hora.value = hora_seleccionada
+        campo_fecha.value = momento.date().isoformat()
+        campo_hora.value = momento.strftime("%H:%M:%S")
         selector_fecha.value = datetime.datetime.combine(
             momento.date(), datetime.time.min
         )
@@ -359,294 +346,645 @@ def abrir_ventana(
         boton_ahora.visible = False
         page.update()
 
-    def obtener_fecha():
-        if fecha_fijada is not None:
-            return fecha_fijada
-        return datetime.datetime.now().date().isoformat()
-
-    def obtener_hora():
-        if hora_fijada is not None:
-            return hora_fijada
-        return datetime.datetime.now().strftime("%H:%M:%S")
-
-    async def desplazar_a_turno(turno: int):
-        await columna_principal.scroll_to(
-            scroll_key=f"turno-{turno}",
-            duration=500,
-        )
-
     boton_ahora = ft.TextButton(
-        "Usar fecha y hora actuales",
-        icon=ft.Icons.UPDATE_ROUNDED,
-        visible=False,
-        on_click=establecer_ahora,
+        "Usar fecha y hora actuales", icon=ft.Icons.UPDATE_ROUNDED,
+        visible=False, on_click=establecer_ahora,
     )
 
-    def actualizar_lista_borradores():
-        columna_borradores.controls.clear()
-        seleccionados = 0
-        for clave in sorted(borradores):
-            fecha, turno = clave
-            check = selecciones[clave]
-            seleccionados += int(bool(check.value))
-            color = COLOR_TURNO[turno]
-            columna_borradores.controls.append(
+    campos: dict[str, ft.TextField] = {}
+    paneles_caldera: list[ft.Container] = []
+
+    for caldera in CALDERAS:
+        fondo = "#EFF6FF" if caldera == 1 else "#FFF7ED"
+        color_caldera = "#0284C7" if caldera == 1 else "#EA580C"
+        color_borde = "#BFDBFE" if caldera == 1 else "#FED7AA"
+        parametros = (
+            (f"purga_{caldera}_ph", "pH", "UN", True),
+            (f"purga_{caldera}_alcalinidad_m", "Alcalinidad M", "ppm", True),
+            (f"purga_{caldera}_color", "Color", "", False),
+            (f"purga_{caldera}_soda_g", "Soda adicionada", "g", True),
+        )
+        entradas: list[ft.TextField] = []
+
+        for clave, nombre, unidad, numerico in parametros:
+            etiqueta = f"{nombre} ({unidad})" if unidad else nombre
+            control = ft.TextField(
+                label=etiqueta,
+                hint_text="Hasta 2 decimales" if numerico else "Texto breve",
+                keyboard_type=(
+                    ft.KeyboardType.NUMBER if numerico else ft.KeyboardType.TEXT
+                ),
+                max_length=20 if numerico else 50, width=205,
+                color="#334155", label_style=ft.TextStyle(color="#475569"),
+                border_radius=8, border_color="#CBD5E1",
+                focused_border_color=color_caldera,
+            )
+            campos[clave] = control
+            entradas.append(control)
+
+        paneles_caldera.append(
+            ft.Container(
+                expand=True, padding=16, bgcolor=fondo,
+                border=ft.Border.all(1, color_borde), border_radius=11,
+                content=ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.Icons.LOCAL_FIRE_DEPARTMENT_ROUNDED,
+                                color=color_caldera),
+                        ft.Text(f"PURGA CALDERA #{caldera}", size=15,
+                                weight=ft.FontWeight.BOLD, color=color_caldera),
+                    ], spacing=8),
+                    ft.Row(controls=entradas, spacing=10, run_spacing=10, wrap=True),
+                ], spacing=12),
+            )
+        )
+
+    campo_observaciones = ft.TextField(
+        label="Observaciones del registro",
+        hint_text="Novedades, desviaciones o acciones realizadas...",
+        multiline=True,
+        min_lines=3,
+        max_lines=5,
+        max_length=1000,
+        width=900,
+        border_radius=8,
+        border_color="#CBD5E1",
+        focused_border_color=COLOR_PRIMARIO,
+    )
+
+    mensaje_estado = ft.Text("", visible=False, size=13)
+    estado_edicion = ft.Text("", visible=False, size=12, color="#1D4ED8")
+    columna_borradores = ft.Column(spacing=8)
+    estado_vacio = ft.Container(
+        padding=18, bgcolor="#F8FAFC", border=ft.Border.all(1, COLOR_BORDE),
+        border_radius=9,
+        content=ft.Text(
+            "Aún no hay borradores. Completa las dos calderas y guarda el registro.",
+            size=13, color="#475569",
+        ),
+    )
+    boton_enviar = ft.ElevatedButton(
+        "Enviar borradores seleccionados", icon=ft.Icons.SEND_ROUNDED,
+        bgcolor=COLOR_PRIMARIO, color="white", disabled=True,
+    )
+
+    def limpiar_captura():
+        nonlocal id_borrador_en_edicion
+        for control in campos.values():
+            control.value = ""
+        campo_observaciones.value = ""
+        id_borrador_en_edicion = None
+        estado_edicion.visible = False
+        boton_guardar.text = "Guardar registro como borrador"
+        boton_guardar.icon = ft.Icons.DRAFTS_OUTLINED
+
+    def buscar_borrador(id_temporal: str) -> BorradorRegistro | None:
+        return next(
+            (borrador for borrador in borradores
+             if borrador.id_temporal == id_temporal),
+            None,
+        )
+
+    def ver_borrador(id_temporal: str):
+        borrador = buscar_borrador(id_temporal)
+
+        if borrador is None:
+            mostrar_mensaje(
+                "El borrador ya no está disponible.",
+                COLOR_ERROR,
+            )
+            return
+
+        desviaciones = obtener_desviaciones(borrador.valores)
+
+        def crear_fila_detalle(
+            etiqueta: str,
+            valor: str,
+            unidad: str = "",
+        ):
+            texto_valor = f"{valor} {unidad}" if unidad else valor
+
+            return ft.Container(
+                padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+                bgcolor="white",
+                border=ft.Border.all(1, "#E2E8F0"),
+                border_radius=7,
+                content=ft.Row(
+                    [
+                        ft.Text(
+                            etiqueta,
+                            size=12,
+                            color="#64748B",
+                            weight=ft.FontWeight.W_500,
+                        ),
+                        ft.Text(
+                            texto_valor,
+                            size=13,
+                            color=COLOR_TITULO,
+                            weight=ft.FontWeight.BOLD,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            )
+
+        tarjetas_caldera = []
+
+        for caldera in CALDERAS:
+            color_caldera = "#0284C7" if caldera == 1 else "#EA580C"
+            fondo_caldera = "#EFF6FF" if caldera == 1 else "#FFF7ED"
+            borde_caldera = "#BFDBFE" if caldera == 1 else "#FED7AA"
+
+            tarjetas_caldera.append(
                 ft.Container(
-                    padding=12,
-                    bgcolor="white",
-                    border=ft.Border.all(1, COLOR_BORDE),
-                    border_radius=9,
-                    content=ft.Row(
+                    expand=True,
+                    padding=14,
+                    bgcolor=fondo_caldera,
+                    border=ft.Border.all(1, borde_caldera),
+                    border_radius=12,
+                    content=ft.Column(
                         [
-                            check,
-                            ft.Column(
+                            ft.Row(
                                 [
-                                    ft.Text(
-                                        f"Turno {turno} · {fecha} · "
-                                        f"{borradores[clave]['hora']}",
-                                        weight=ft.FontWeight.BOLD,
-                                        color=COLOR_TITULO,
+                                    ft.Container(
+                                        width=38,
+                                        height=38,
+                                        alignment=ft.Alignment.CENTER,
+                                        bgcolor="white",
+                                        border_radius=9,
+                                        content=ft.Icon(
+                                            ft.Icons.LOCAL_FIRE_DEPARTMENT_ROUNDED,
+                                            color=color_caldera,
+                                            size=22,
+                                        ),
                                     ),
                                     ft.Text(
-                                        "Dos purgas, entrega y recibe completos.",
-                                        size=12,
-                                        color="#475569",
+                                        f"CALDERA #{caldera}",
+                                        size=14,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=color_caldera,
                                     ),
                                 ],
-                                spacing=3,
-                                expand=True,
+                                spacing=9,
                             ),
-                            ft.OutlinedButton(
-                                "Cargar / editar",
-                                icon=ft.Icons.EDIT_OUTLINED,
-                                on_click=lambda _, k=clave: cargar_borrador(k),
-                                style=ft.ButtonStyle(
-                                    color=color,
-                                    side=ft.BorderSide(1, color),
+                            crear_fila_detalle(
+                                "pH",
+                                str(borrador.valores[f"purga_{caldera}_ph"]),
+                            ),
+                            crear_fila_detalle(
+                                "Alcalinidad M",
+                                str(
+                                    borrador.valores[
+                                        f"purga_{caldera}_alcalinidad_m"
+                                    ]
+                                ),
+                                "ppm",
+                            ),
+                            crear_fila_detalle(
+                                "Color",
+                                str(
+                                    borrador.valores[
+                                        f"purga_{caldera}_color"
+                                    ]
                                 ),
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                                tooltip="Eliminar borrador",
-                                icon_color="#B91C1C",
-                                on_click=lambda _, k=clave: eliminar_borrador(k),
+                            crear_fila_detalle(
+                                "Soda adicionada",
+                                str(
+                                    borrador.valores[
+                                        f"purga_{caldera}_soda_g"
+                                    ]
+                                ),
+                                "g",
                             ),
                         ],
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         spacing=8,
                     ),
                 )
             )
+
+        if desviaciones:
+            bloque_control = ft.Container(
+                padding=12,
+                bgcolor="#FEF2F2",
+                border=ft.Border.all(1, "#FECACA"),
+                border_radius=10,
+                content=ft.Column(
+                    [
+                        ft.Row(
+                            [
+                                ft.Icon(
+                                    ft.Icons.WARNING_AMBER_ROUNDED,
+                                    color=COLOR_ERROR,
+                                    size=20,
+                                ),
+                                ft.Text(
+                                    "DESVIACIONES DETECTADAS",
+                                    color=COLOR_ERROR,
+                                    weight=ft.FontWeight.BOLD,
+                                    size=13,
+                                ),
+                            ],
+                            spacing=7,
+                        ),
+                        *[
+                            ft.Text(
+                                f"• {desviacion}",
+                                size=12,
+                                color="#7F1D1D",
+                            )
+                            for desviacion in desviaciones
+                        ],
+                    ],
+                    spacing=6,
+                ),
+            )
+        else:
+            bloque_control = ft.Container(
+                padding=12,
+                bgcolor="#F0FDF4",
+                border=ft.Border.all(1, "#BBF7D0"),
+                border_radius=10,
+                content=ft.Row(
+                    [
+                        ft.Icon(
+                            ft.Icons.CHECK_CIRCLE_ROUNDED,
+                            color=COLOR_EXITO,
+                            size=21,
+                        ),
+                        ft.Text(
+                            "Valores dentro de los controles definidos.",
+                            color=COLOR_EXITO,
+                            weight=ft.FontWeight.BOLD,
+                            size=13,
+                        ),
+                    ],
+                    spacing=8,
+                ),
+            )
+
+        dialogo = ft.AlertDialog(
+            modal=True,
+            bgcolor="white",
+            title=ft.Container(
+                padding=ft.Padding.only(bottom=6),
+                content=ft.Row(
+                    [
+                        ft.Container(
+                            width=42,
+                            height=42,
+                            alignment=ft.Alignment.CENTER,
+                            bgcolor="#EFF6FF",
+                            border_radius=10,
+                            content=ft.Icon(
+                                ft.Icons.VISIBILITY_ROUNDED,
+                                color=COLOR_PRIMARIO,
+                                size=23,
+                            ),
+                        ),
+                        ft.Column(
+                            [
+                                ft.Text(
+                                    "Vista previa del borrador",
+                                    size=18,
+                                    color=COLOR_PRIMARIO,
+                                    weight=ft.FontWeight.BOLD,
+                                ),
+                                ft.Text(
+                                    "Revisa la información antes de enviarla.",
+                                    size=12,
+                                    color="#64748B",
+                                ),
+                            ],
+                            spacing=2,
+                        ),
+                    ],
+                    spacing=11,
+                ),
+            ),
+            content=ft.Container(
+                width=700,
+                height=520,
+                bgcolor="white",
+                content=ft.Column(
+                    [
+                        ft.Container(
+                            padding=12,
+                            bgcolor="#F8FAFC",
+                            border=ft.Border.all(1, COLOR_BORDE),
+                            border_radius=10,
+                            content=ft.Row(
+                                [
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.CALENDAR_MONTH_ROUNDED,
+                                                color=COLOR_PRIMARIO,
+                                                size=20,
+                                            ),
+                                            ft.Text(
+                                                borrador.fecha,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=COLOR_TITULO,
+                                            ),
+                                        ],
+                                        spacing=6,
+                                    ),
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.ACCESS_TIME_ROUNDED,
+                                                color=COLOR_PRIMARIO,
+                                                size=20,
+                                            ),
+                                            ft.Text(
+                                                borrador.hora,
+                                                weight=ft.FontWeight.BOLD,
+                                                color=COLOR_TITULO,
+                                            ),
+                                        ],
+                                        spacing=6,
+                                    ),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                        ),
+                        ft.Row(
+                            tarjetas_caldera,
+                            spacing=12,
+                            vertical_alignment=ft.CrossAxisAlignment.START,
+                        ),
+                        ft.Container(
+                            padding=12,
+                            bgcolor="#F8FAFC",
+                            border=ft.Border.all(1, COLOR_BORDE),
+                            border_radius=10,
+                            content=ft.Column(
+                                [
+                                    ft.Row(
+                                        [
+                                            ft.Icon(
+                                                ft.Icons.COMMENT_OUTLINED,
+                                                color=COLOR_PRIMARIO,
+                                                size=20,
+                                            ),
+                                            ft.Text(
+                                                "OBSERVACIONES",
+                                                weight=ft.FontWeight.BOLD,
+                                                color=COLOR_TITULO,
+                                            ),
+                                        ],
+                                        spacing=7,
+                                    ),
+                                    ft.Text(
+                                        borrador.observaciones
+                                        or "Sin observaciones.",
+                                        color="#475569",
+                                        size=13,
+                                    ),
+                                ],
+                                spacing=7,
+                            ),
+                        ),
+                        bloque_control,
+                    ],
+                    spacing=12,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+            ),
+            actions=[
+                ft.OutlinedButton(
+                    "Cargar para editar",
+                    icon=ft.Icons.EDIT_OUTLINED,
+                    on_click=lambda _: (
+                        cerrar_dialogo(dialogo),
+                        cargar_borrador(id_temporal),
+                    ),
+                    style=ft.ButtonStyle(
+                        color=COLOR_PRIMARIO,
+                        side=ft.BorderSide(1, COLOR_PRIMARIO),
+                    ),
+                ),
+                ft.ElevatedButton(
+                    "Cerrar",
+                    icon=ft.Icons.CLOSE_ROUNDED,
+                    bgcolor=COLOR_PRIMARIO,
+                    color="white",
+                    on_click=lambda _: cerrar_dialogo(dialogo),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+
+        mostrar_dialogo(dialogo)
+
+    def actualizar_lista_borradores():
+        columna_borradores.controls.clear()
+        seleccionados = 0
+
+        for borrador in sorted(borradores, key=lambda item: (item.fecha, item.hora)):
+            checkbox = selecciones[borrador.id_temporal]
+            seleccionados += int(bool(checkbox.value))
+            desviaciones = obtener_desviaciones(borrador.valores)
+            detalle = (
+                f"{len(desviaciones)} desviación(es) detectada(s)."
+                if desviaciones else
+                "Valores dentro de los controles definidos."
+            )
+            color_detalle = COLOR_ALERTA if desviaciones else COLOR_EXITO
+
+            columna_borradores.controls.append(
+                ft.Container(
+                    padding=12, bgcolor="white",
+                    border=ft.Border.all(1, COLOR_BORDE), border_radius=9,
+                    content=ft.Row([
+                        checkbox,
+                        ft.Column([
+                            ft.Text(
+                                f"Registro del {borrador.fecha} a las {borrador.hora}",
+                                weight=ft.FontWeight.BOLD, color=COLOR_TITULO,
+                            ),
+                            ft.Text(
+                                f"Usuario: {borrador.usuario_registro} | {detalle}",
+                                size=12, color=color_detalle,
+                            ),
+                            ft.Text(
+                                f"Observaciones: {borrador.observaciones or 'Sin observaciones'}",
+                                size=11,
+                                color="#64748B",
+                                max_lines=2,
+                                overflow=ft.TextOverflow.ELLIPSIS,
+                            ),
+                        ], spacing=3, expand=True),
+                        ft.IconButton(
+                            icon=ft.Icons.VISIBILITY_ROUNDED,
+                            tooltip="Ver borrador",
+                            icon_color=COLOR_PRIMARIO,
+                            on_click=lambda _, rid=borrador.id_temporal: ver_borrador(rid),
+                        ),
+                        ft.OutlinedButton(
+                            "Cargar / editar", icon=ft.Icons.EDIT_OUTLINED,
+                            on_click=lambda _, rid=borrador.id_temporal: cargar_borrador(rid),
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                            tooltip="Eliminar borrador", icon_color=COLOR_ERROR,
+                            on_click=lambda _, rid=borrador.id_temporal: eliminar_borrador(rid),
+                        ),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
+                )
+            )
+
         estado_vacio.visible = not borradores
         boton_enviar.disabled = seleccionados == 0
         page.update()
 
-    def cargar_borrador(clave: tuple[str, int]):
-        nonlocal fecha_fijada, fecha_seleccionada, hora_fijada, hora_seleccionada
-        _, turno = clave
-        borrador = borradores[clave]
-        borrador_en_edicion[turno] = clave
-        fecha_fijada = str(borrador["fecha"])
-        hora_fijada = str(borrador["hora"])
-        fecha_seleccionada = fecha_fijada
-        hora_seleccionada = hora_fijada
-        campo_fecha.value = fecha_seleccionada
-        campo_hora.value = hora_seleccionada
-        selector_fecha.value = datetime.datetime.combine(
-            datetime.date.fromisoformat(fecha_seleccionada),
-            datetime.time.min,
-        )
-        selector_hora.value = datetime.time.fromisoformat(hora_seleccionada)
-        boton_ahora.visible = True
-        for campo, valor in borrador["valores"].items():
-            campos_turno[turno][campo].value = str(valor)
-        estado = estados_turno[turno]
-        estado.value = "Borrador cargado. Edita los campos y vuelve a guardarlo."
-        estado.color = "#1D4ED8"
-        estado.visible = True
-        page.update()
-        page.run_task(desplazar_a_turno, turno)
-
-    def eliminar_borrador(clave: tuple[str, int]):
-        _, turno = clave
-        borradores.pop(clave, None)
-        selecciones.pop(clave, None)
-        if borrador_en_edicion.get(turno) == clave:
-            borrador_en_edicion.pop(turno, None)
-        estados_turno[turno].value = (
-            "Borrador eliminado. Completa el turno y guárdalo de nuevo."
-        )
-        estados_turno[turno].color = "#475569"
-        estados_turno[turno].visible = True
-        actualizar_lista_borradores()
-
-    def guardar_borrador(turno: int, _):
-        nonlocal fecha_seleccionada, hora_seleccionada
-        estado = estados_turno[turno]
-        try:
-            valores = validar_turno(
-                turno,
-                {
-                    campo: control.value or ""
-                    for campo, control in campos_turno[turno].items()
-                },
-            )
-        except ValueError as ex:
-            estado.value = str(ex)
-            estado.color = "#B91C1C"
-            estado.visible = True
-            page.update()
+    def cargar_borrador(id_temporal: str):
+        nonlocal id_borrador_en_edicion, fecha_fijada, hora_fijada
+        borrador = buscar_borrador(id_temporal)
+        if borrador is None:
+            mostrar_mensaje("El borrador ya no está disponible.", COLOR_ERROR)
             return
 
-        fecha_seleccionada = obtener_fecha()
-        hora_seleccionada = obtener_hora()
-        clave = (fecha_seleccionada, turno)
-        clave_anterior = borrador_en_edicion.pop(turno, None)
-        if clave_anterior is not None and clave_anterior != clave:
-            borradores.pop(clave_anterior, None)
-            selecciones.pop(clave_anterior, None)
-        borradores[clave] = {
-            "turno": turno,
-            "fecha": fecha_seleccionada,
-            "hora": hora_seleccionada,
-            "valores": valores,
-        }
-        selecciones[clave] = ft.Checkbox(
-            label="Incluir",
-            value=True,
-            on_change=lambda _: actualizar_lista_borradores(),
-        )
-        for control in campos_turno[turno].values():
-            control.value = ""
-        estado.value = (
-            "Borrador guardado y campos limpiados. Usa Cargar / editar para "
-            "recuperar sus valores."
-        )
-        estado.color = "#15803D"
-        estado.visible = True
-        actualizar_lista_borradores()
+        id_borrador_en_edicion = id_temporal
 
-    def completar_envio(claves_a_enviar: list[tuple[str, int]]):
-        boton_enviar.disabled = True
+        # La fecha original del borrador se conserva durante la edición.
+        fecha_fijada = borrador.fecha
+        campo_fecha.value = borrador.fecha
+        selector_fecha.value = datetime.datetime.combine(
+        datetime.date.fromisoformat(borrador.fecha),
+        datetime.time.min,
+        )
+
+        # La hora no se fija al cargar el borrador.
+        # Continúa avanzando y al actualizar se guarda la hora actual.
+        hora_fijada = None
+        momento_actual = datetime.datetime.now()
+        campo_hora.value = momento_actual.strftime("%H:%M:%S")
+        selector_hora.value = momento_actual.time()
+
+        # Se mantiene visible porque la fecha está fijada al día del borrador.
+        boton_ahora.visible = True
+
+        for nombre, valor in borrador.valores.items():
+            if nombre in campos:
+                campos[nombre].value = str(valor)
+        campo_observaciones.value = borrador.observaciones
+
+        boton_guardar.text = "Actualizar borrador"
+        boton_guardar.icon = ft.Icons.SAVE_AS_OUTLINED
+        estado_edicion.value = "Estás editando un borrador existente."
+        estado_edicion.visible = True
         mensaje_estado.visible = False
         page.update()
-        seleccionados = [borradores[clave] for clave in claves_a_enviar]
-        fecha = str(seleccionados[0]["fecha"])
-        try:
-            ids = insertar_borradores_bd(
-                fecha,
-                usuario_logueado,
-                seleccionados,
+
+    def eliminar_borrador(id_temporal: str):
+        nonlocal id_borrador_en_edicion
+        borrador = buscar_borrador(id_temporal)
+        if borrador is None:
+            return
+        borradores.remove(borrador)
+        selecciones.pop(id_temporal, None)
+
+        if id_borrador_en_edicion == id_temporal:
+            limpiar_captura()
+
+        actualizar_lista_borradores()
+        mostrar_mensaje("Borrador eliminado.", COLOR_ERROR)
+
+    def guardar_borrador_confirmado(
+        dialogo,
+        fecha: str,
+        hora: str,
+        valores: dict[str, object],
+    ):
+        cerrar_dialogo(dialogo)
+        guardar_o_actualizar_borrador(fecha, hora, valores)
+
+    def guardar_o_actualizar_borrador(
+        fecha: str,
+        hora: str,
+        valores: dict[str, object],
+    ):
+        nonlocal id_borrador_en_edicion
+
+        if id_borrador_en_edicion is None:
+            id_temporal = uuid4().hex
+            borrador = BorradorRegistro(
+                id_temporal=id_temporal,
+                fecha=fecha,
+                hora=hora,
+                usuario_registro=usuario_logueado.strip(),
+                valores=dict(valores),
+                observaciones=(campo_observaciones.value or "").strip(),
             )
-        except ValueError as ex:
-            mensaje_estado.value = str(ex)
-            mensaje_estado.color = "#B91C1C"
-            mensaje_estado.visible = True
-        except pyodbc.Error:
-            logging.exception("SQL Server rechazó el envío del Formulario 3.")
-            mensaje_estado.value = (
-                "No fue posible enviar los turnos. Verifica SQL Server e inténtalo "
-                "de nuevo. Si ya existe ese turno para la fecha, actualiza la lista."
+            borradores.append(borrador)
+            selecciones[id_temporal] = ft.Checkbox(
+                label="Incluir", value=True,
+                on_change=lambda _: actualizar_lista_borradores(),
             )
-            mensaje_estado.color = "#B91C1C"
-            mensaje_estado.visible = True
-        except RuntimeError:
-            logging.exception("SQL Server no confirmó el guardado del Formulario 3.")
-            mensaje_estado.value = (
-                "SQL Server no confirmó el guardado. Revisa la conexión e "
-                "inténtalo de nuevo."
-            )
-            mensaje_estado.color = "#B91C1C"
-            mensaje_estado.visible = True
+            mensaje = "Registro guardado como borrador para revisión."
         else:
-            for clave, id_registro in zip(claves_a_enviar, ids):
-                _, turno = clave
-                borradores.pop(clave, None)
-                selecciones.pop(clave, None)
-                estados_turno[turno].value = (
-                    f"Turno {turno} guardado en SQL Server "
-                    f"(registro {id_registro})."
-                )
-                estados_turno[turno].color = "#15803D"
-                estados_turno[turno].visible = True
-            mensaje_estado.value = (
-                f"Se enviaron {len(ids)} turno(s) para la fecha {fecha}."
+            anterior = buscar_borrador(id_borrador_en_edicion)
+            if anterior is None:
+                id_borrador_en_edicion = None
+                mostrar_mensaje("No fue posible actualizar el borrador.", COLOR_ERROR)
+                return
+            indice = borradores.index(anterior)
+            borradores[indice] = BorradorRegistro(
+                id_temporal=anterior.id_temporal,
+                fecha=fecha,
+                hora=hora,
+                usuario_registro=usuario_logueado.strip(),
+                valores=dict(valores),
+                observaciones=(campo_observaciones.value or "").strip(),
             )
-            mensaje_estado.color = "#15803D"
-            mensaje_estado.visible = True
-        finally:
-            actualizar_lista_borradores()
+            mensaje = "Borrador actualizado correctamente."
 
-    def enviar_borradores(_):
-        claves_a_enviar = [
-            clave
-            for clave in borradores
-            if selecciones[clave].value
-        ]
-        if not claves_a_enviar:
-            mensaje_estado.value = "Selecciona al menos un borrador para enviar."
-            mensaje_estado.color = "#B91C1C"
-            mensaje_estado.visible = True
-            page.update()
-            return
-        fechas = {
-            str(borradores[clave]["fecha"])
-            for clave in claves_a_enviar
-        }
-        if len(fechas) != 1:
-            mensaje_estado.value = (
-                "Envía por separado los borradores que tengan fechas distintas."
-            )
-            mensaje_estado.color = "#B91C1C"
-            mensaje_estado.visible = True
-            page.update()
+        limpiar_captura()
+        actualizar_lista_borradores()
+        mostrar_mensaje(mensaje, COLOR_EXITO)
+
+    def guardar_borrador(_):
+        mensaje_estado.visible = False
+        try:
+            valores = validar_registro({
+                nombre: control.value or ""
+                for nombre, control in campos.items()
+            })
+        except ValueError as ex:
+            mostrar_mensaje(str(ex), COLOR_ERROR)
             return
 
-        desviaciones = []
-        for clave in claves_a_enviar:
-            turno = clave[1]
-            desviaciones.extend(
-                f"Turno {turno} · {desviacion}"
-                for desviacion in obtener_desviaciones(
-                    borradores[clave]["valores"]
-                )
-            )
+        fecha = obtener_fecha()
+        hora = obtener_hora()
+        desviaciones = obtener_desviaciones(valores)
+
         if not desviaciones:
-            completar_envio(claves_a_enviar)
+            guardar_o_actualizar_borrador(fecha, hora, valores)
             return
 
         dialogo = ft.AlertDialog(
             modal=True,
             title=ft.Text(
                 f"{len(desviaciones)} valor(es) fuera del control",
-                color="#991B1B",
-                weight=ft.FontWeight.BOLD,
+                color="#991B1B", weight=ft.FontWeight.BOLD,
             ),
             content=ft.Container(
-                width=520,
-                height=280,
-                content=ft.Column(
-                    [
-                        ft.Text(
-                            "Revisa las desviaciones. Puedes volver a editar "
-                            "o confirmar el envío.",
-                            size=13,
-                            color="#475569",
-                        ),
-                        *[
-                            ft.Container(
-                                padding=9,
-                                bgcolor="#FEF2F2",
-                                border=ft.Border.all(1, "#FECACA"),
-                                border_radius=8,
-                                content=ft.Text(item, color="#7F1D1D", size=13),
-                            )
-                            for item in desviaciones
-                        ],
+                width=520, height=280,
+                content=ft.Column([
+                    ft.Text(
+                        "Puedes corregir los valores o conservarlos en el borrador.",
+                        size=13, color="#475569",
+                    ),
+                    *[
+                        ft.Container(
+                            padding=9, bgcolor="#FEF2F2",
+                            border=ft.Border.all(1, "#FECACA"), border_radius=8,
+                            content=ft.Text(item, color="#7F1D1D", size=13),
+                        ) for item in desviaciones
                     ],
-                    spacing=8,
-                    scroll=ft.ScrollMode.AUTO,
-                ),
+                ], spacing=8, scroll=ft.ScrollMode.AUTO),
             ),
             actions=[
                 ft.OutlinedButton(
@@ -654,204 +992,163 @@ def abrir_ventana(
                     on_click=lambda _: cerrar_dialogo(dialogo),
                 ),
                 ft.ElevatedButton(
-                    "Confirmar y enviar",
-                    icon=ft.Icons.CHECK_CIRCLE_ROUNDED,
-                    bgcolor="#16A34A",
-                    color="white",
-                    on_click=lambda _: confirmar_envio(dialogo, claves_a_enviar),
+                    "Conservar como borrador", icon=ft.Icons.DRAFTS_OUTLINED,
+                    bgcolor=COLOR_ALERTA, color="white",
+                    on_click=lambda _: guardar_borrador_confirmado(
+                        dialogo, fecha, hora, valores
+                    ),
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
         mostrar_dialogo(dialogo)
 
-    def confirmar_envio(dialogo, claves_a_enviar: list[tuple[str, int]]):
+    boton_guardar = ft.ElevatedButton(
+        "Guardar registro como borrador", icon=ft.Icons.DRAFTS_OUTLINED,
+        bgcolor=COLOR_PRIMARIO, color="white", on_click=guardar_borrador,
+    )
+
+    def completar_envio(ids_seleccionados: list[str]):
+        seleccionados = [
+            borrador for borrador in borradores
+            if borrador.id_temporal in ids_seleccionados
+        ]
+        boton_enviar.disabled = True
+        page.update()
+
+        try:
+            ids_bd = insertar_borradores_bd(seleccionados)
+        except ValueError as ex:
+            mostrar_mensaje(str(ex), COLOR_ERROR)
+        except pyodbc.Error:
+            logging.exception("SQL Server rechazó el envío del Formulario 3.")
+            mostrar_mensaje(
+                "No fue posible enviar los registros. Verifica la conexión, "
+                "la tabla y sus columnas en SQL Server.",
+                COLOR_ERROR,
+            )
+        except RuntimeError as ex:
+            logging.exception("SQL Server no confirmó el Formulario 3.")
+            mostrar_mensaje(str(ex), COLOR_ERROR)
+        else:
+            borradores[:] = [
+                borrador for borrador in borradores
+                if borrador.id_temporal not in ids_seleccionados
+            ]
+            for id_temporal in ids_seleccionados:
+                selecciones.pop(id_temporal, None)
+            actualizar_lista_borradores()
+            mostrar_mensaje(
+                f"Se enviaron {len(ids_bd)} registro(s) a SQL Server. "
+                f"Identificadores: {', '.join(map(str, ids_bd))}.",
+                COLOR_EXITO,
+            )
+        finally:
+            actualizar_lista_borradores()
+
+    def confirmar_envio(dialogo, ids_seleccionados: list[str]):
         cerrar_dialogo(dialogo)
-        completar_envio(claves_a_enviar)
+        completar_envio(ids_seleccionados)
+
+    def enviar_borradores(_):
+        ids_seleccionados = [
+            borrador.id_temporal
+            for borrador in borradores
+            if selecciones[borrador.id_temporal].value
+        ]
+        if not ids_seleccionados:
+            mostrar_mensaje("Selecciona al menos un borrador para enviar.", COLOR_ERROR)
+            return
+
+        seleccionados = [
+            borrador for borrador in borradores
+            if borrador.id_temporal in ids_seleccionados
+        ]
+        desviaciones = sum(
+            len(obtener_desviaciones(borrador.valores))
+            for borrador in seleccionados
+        )
+
+        resumen = ft.Column([
+            ft.Container(
+                padding=9, bgcolor="#F8FAFC", border_radius=8,
+                content=ft.Text(
+                    f"{borrador.fecha} {borrador.hora} | "
+                    f"Usuario: {borrador.usuario_registro} | "
+                    f"pH C1: {borrador.valores['purga_1_ph']} | "
+                    f"pH C2: {borrador.valores['purga_2_ph']} | "
+                    f"Observaciones: {borrador.observaciones or 'Sin observaciones'}",
+                    size=12,
+                ),
+            ) for borrador in seleccionados
+        ], spacing=6, scroll=ft.ScrollMode.AUTO)
+
+        dialogo = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(
+                "Confirmar envío a SQL Server",
+                color=COLOR_PRIMARIO, weight=ft.FontWeight.BOLD,
+            ),
+            content=ft.Container(
+                width=620,
+                height=min(410, 150 + len(seleccionados) * 55),
+                content=ft.Column([
+                    ft.Text(
+                        f"Se enviarán {len(seleccionados)} registro(s). "
+                        f"Desviaciones encontradas: {desviaciones}.",
+                        color="#475569",
+                    ),
+                    resumen,
+                    ft.Text(
+                        "Después de confirmar, los registros quedarán guardados "
+                        "definitivamente en la base de datos.",
+                        size=12, color="#64748B",
+                    ),
+                ], spacing=10),
+            ),
+            actions=[
+                ft.OutlinedButton(
+                    "Cancelar", on_click=lambda _: cerrar_dialogo(dialogo),
+                ),
+                ft.ElevatedButton(
+                    "Confirmar y enviar", icon=ft.Icons.CLOUD_UPLOAD_ROUNDED,
+                    bgcolor=COLOR_EXITO, color="white",
+                    on_click=lambda _: confirmar_envio(
+                        dialogo, ids_seleccionados
+                    ),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        mostrar_dialogo(dialogo)
 
     boton_enviar.on_click = enviar_borradores
-
-    tarjetas_turno = []
-    for turno in TURNOS:
-        color = COLOR_TURNO[turno]
-        campos: dict[str, ft.TextField] = {}
-        paneles_caldera = []
-        for caldera in CALDERAS:
-            fondo = "#EFF6FF" if caldera == 1 else "#FFF7ED"
-            color_caldera = "#0284C7" if caldera == 1 else "#EA580C"
-            parametros = (
-                (f"purga_{caldera}_ph", "pH", "UN", True),
-                (
-                    f"purga_{caldera}_alcalinidad_m",
-                    "Alcalinidad M",
-                    "ppm",
-                    True,
-                ),
-                (f"purga_{caldera}_color", "Color", "", False),
-                (f"purga_{caldera}_soda_g", "Soda adicionada", "g", True),
-            )
-            entradas = []
-            for clave, nombre, unidad, numerico in parametros:
-                etiqueta = f"{nombre} ({unidad})" if unidad else nombre
-                campo = ft.TextField(
-                    label=etiqueta,
-                    hint_text="Hasta 2 decimales" if numerico else "Texto breve",
-                    keyboard_type=(
-                        ft.KeyboardType.NUMBER if numerico else ft.KeyboardType.TEXT
-                    ),
-                    max_length=20 if numerico else 50,
-                    width=205,
-                    color="#334155",
-                    label_style=ft.TextStyle(color="#475569"),
-                    border_radius=8,
-                    border_color="#CBD5E1",
-                    focused_border_color=color_caldera,
-                )
-                campos[clave] = campo
-                entradas.append(campo)
-            paneles_caldera.append(
-                ft.Container(
-                    padding=14,
-                    bgcolor=fondo,
-                    border=ft.Border.all(1, "#BFDBFE" if caldera == 1 else "#FED7AA"),
-                    border_radius=11,
-                    content=ft.Column(
-                        [
-                            ft.Text(
-                                f"PURGA CALDERA #{caldera}",
-                                size=14,
-                                weight=ft.FontWeight.BOLD,
-                                color=color_caldera,
-                            ),
-                            ft.Row(controls=entradas, spacing=10, run_spacing=8, wrap=True),
-                        ],
-                        spacing=10,
-                    ),
-                )
-            )
-
-        for campo, nombre in (("entrega", "Entrega"), ("recibe", "Recibe")):
-            campos[campo] = ft.TextField(
-                label=nombre,
-                max_length=100,
-                width=250,
-                color="#334155",
-                label_style=ft.TextStyle(color="#475569"),
-                border_radius=8,
-                border_color="#CBD5E1",
-                focused_border_color=color,
-            )
-        campos_turno[turno] = campos
-        estados_turno[turno] = ft.Text("", visible=False, size=12)
-        boton_borrador = ft.OutlinedButton(
-            f"Guardar Turno {turno} como borrador",
-            icon=ft.Icons.DRAFTS_OUTLINED,
-            on_click=lambda e, t=turno: guardar_borrador(t, e),
-            style=ft.ButtonStyle(
-                color=color,
-                side=ft.BorderSide(1, color),
-                shape=ft.RoundedRectangleBorder(radius=8),
-                padding=ft.Padding.symmetric(horizontal=16, vertical=12),
-            ),
-        )
-        tarjetas_turno.append(
-            ft.Container(
-                key=f"turno-{turno}",
-                padding=18,
-                bgcolor="white",
-                border=ft.Border.all(1, COLOR_BORDE),
-                border_radius=14,
-                content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.Container(
-                                    width=42,
-                                    height=42,
-                                    alignment=ft.Alignment.CENTER,
-                                    bgcolor="#F1F5F9",
-                                    border_radius=11,
-                                    content=ft.Icon(
-                                        ft.Icons.LOCAL_FIRE_DEPARTMENT_ROUNDED,
-                                        color=color,
-                                        size=24,
-                                    ),
-                                ),
-                                ft.Text(
-                                    f"TURNO {turno}",
-                                    size=17,
-                                    weight=ft.FontWeight.BOLD,
-                                    color=COLOR_TITULO,
-                                    expand=True,
-                                ),
-                            ],
-                            spacing=12,
-                        ),
-                        ft.Row(
-                            controls=paneles_caldera,
-                            spacing=12,
-                            run_spacing=12,
-                            wrap=True,
-                        ),
-                        ft.Text(
-                            "Entrega y recibe",
-                            size=14,
-                            weight=ft.FontWeight.BOLD,
-                            color=COLOR_TITULO,
-                        ),
-                        ft.Row(
-                            [campos["entrega"], campos["recibe"]],
-                            spacing=10,
-                            run_spacing=8,
-                            wrap=True,
-                        ),
-                        estados_turno[turno],
-                        ft.Row(
-                            [boton_borrador],
-                            alignment=ft.MainAxisAlignment.END,
-                        ),
-                    ],
-                    spacing=12,
-                ),
-            )
-        )
 
     def confirmar_salida(_):
         if on_logout is None:
             return
+        mensaje = (
+            f"Hay {len(borradores)} borrador(es) sin enviar. Se perderán al salir."
+            if borradores else
+            "Volverás al menú principal."
+        )
         dialogo = ft.AlertDialog(
             modal=True,
-            title=ft.Row(
-                [
-                    ft.Icon(
-                        ft.Icons.WARNING_AMBER_ROUNDED,
-                        color="#DC2626",
-                        size=28,
-                    ),
-                    ft.Text(
-                        "¿Seguro que deseas salir?",
-                        size=18,
-                        weight=ft.FontWeight.BOLD,
-                        color="#DC2626",
-                    ),
-                ],
-                spacing=8,
-            ),
-            content=ft.Text(
-                "Los borradores aún no enviados se perderán al volver al menú.",
-                size=13,
-                color="#334155",
-            ),
+            title=ft.Row([
+                ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED,
+                        color="#DC2626", size=28),
+                ft.Text("¿Seguro que deseas salir?", size=18,
+                        weight=ft.FontWeight.BOLD, color="#DC2626"),
+            ], spacing=8),
+            content=ft.Text(mensaje, size=13, color="#334155"),
             actions=[
                 ft.OutlinedButton(
-                    "Cancelar",
-                    on_click=lambda _: cerrar_dialogo(dialogo),
+                    "Cancelar", on_click=lambda _: cerrar_dialogo(dialogo),
                 ),
                 ft.ElevatedButton(
-                    "Sí, Continuar y Salir",
+                    "Sí, continuar y salir",
                     on_click=lambda _: salir(dialogo),
-                    bgcolor="#DC2626",
-                    color="white",
+                    bgcolor="#DC2626", color="white",
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -864,27 +1161,26 @@ def abrir_ventana(
         on_logout()
 
     marquee = ft.Text(
-        "",
-        size=16,
-        color="#F8FAFC",
-        weight=ft.FontWeight.BOLD,
-        no_wrap=True,
+        "", size=16, color="#F8FAFC",
+        weight=ft.FontWeight.BOLD, no_wrap=True,
     )
 
     def animar_marquee():
         texto = (
-            " CONTROL DE PURGAS DE CALDERA • TURNO 1 • TURNO 2 • TURNO 3 • "
-            f" RESPONSABLE: {nombre_completo} • USUARIO: {usuario_logueado} • "
-            " CRYSTAL S.A.S • "
+            " CONTROL DE PURGAS DE CALDERA • BORRADORES DE REGISTRO • "
+            f"RESPONSABLE: {nombre_completo} • USUARIO: {usuario_logueado} • "
+            "CRYSTAL S.A.S • "
         ) * 8
         while formulario_activo:
             try:
                 texto = texto[1:] + texto[0]
                 marquee.value = texto
-                marquee.update()
+                if interfaz_lista:
+                    marquee.update()
             except Exception:
-                logging.exception("Se detuvo la animación del encabezado del Formulario 3.")
-                detener_formulario()
+                logging.exception(
+                    "Se detuvo la animación del encabezado del Formulario 3."
+                )
                 break
             time.sleep(0.08)
 
@@ -894,95 +1190,106 @@ def abrir_ventana(
                 momento = datetime.datetime.now()
                 if fecha_fijada is None:
                     campo_fecha.value = momento.date().isoformat()
-                    campo_fecha.update()
                 if hora_fijada is None:
                     campo_hora.value = momento.strftime("%H:%M:%S")
-                    campo_hora.update()
+                txt_reloj.value = momento.strftime("%H:%M:%S")
+                if interfaz_lista:
+                    txt_reloj.update()
+                    if fecha_fijada is None:
+                        campo_fecha.update()
+                    if hora_fijada is None:
+                        campo_hora.update()
             except Exception:
                 logging.exception(
                     "Se detuvo la actualización de fecha y hora del Formulario 3."
                 )
-                detener_formulario()
                 break
             time.sleep(1)
 
     ruta_logo = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "assets",
-        "logo-crystal.png",
+        "assets", "logo-crystal.png",
     )
     logo = (
-        ft.Image(
-            src="logo-crystal.png",
-            width=180,
-            height=60,
-            fit=ft.BoxFit.CONTAIN,
-        )
+        ft.Image(src="logo-crystal.png", width=180, height=60,
+                 fit=ft.BoxFit.CONTAIN)
         if os.path.isfile(ruta_logo)
-        else ft.Text(
-            "CRYSTAL S.A.S.",
-            size=20,
-            weight=ft.FontWeight.BOLD,
-            color=COLOR_PRIMARIO,
-        )
+        else ft.Text("CRYSTAL S.A.S.", size=20,
+                     weight=ft.FontWeight.BOLD, color=COLOR_PRIMARIO)
     )
+
     encabezado = ft.Container(
-        bgcolor="white",
-        border_radius=15,
-        padding=20,
-        content=ft.Column(
-            [
-                ft.IconButton(
-                    icon=ft.Icons.ARROW_BACK_ROUNDED,
-                    icon_color="white",
-                    bgcolor=COLOR_PRIMARIO,
-                    tooltip="Volver al menú",
-                    on_click=confirmar_salida,
+        bgcolor="white", border_radius=15, padding=20,
+        content=ft.Column([
+            ft.IconButton(
+                icon=ft.Icons.ARROW_BACK_ROUNDED, icon_color="white",
+                bgcolor=COLOR_PRIMARIO, tooltip="Volver al menú",
+                on_click=confirmar_salida,
+            ),
+            ft.Row([
+                logo,
+                ft.Container(
+                    expand=True, height=70, bgcolor=COLOR_TITULO,
+                    border_radius=10, padding=12,
+                    alignment=ft.Alignment.CENTER_LEFT, content=marquee,
                 ),
-                ft.Row(
-                    [
-                        logo,
-                        ft.Container(
-                            expand=True,
-                            height=70,
-                            bgcolor="#0F172A",
-                            border_radius=10,
-                            padding=12,
-                            alignment=ft.Alignment.CENTER_LEFT,
-                            content=marquee,
+            ], spacing=15),
+            ft.Divider(),
+            ft.Row(
+                [
+                    ft.Column(
+                        [
+                            ft.Text(
+                                "CONTROL DE PURGAS DE CALDERA",
+                                size=24,
+                                weight=ft.FontWeight.BOLD,
+                                color=COLOR_PRIMARIO,
+                            ),
+                            ft.Text(
+                                f"{nombre_completo} ({usuario_logueado})",
+                                color="#64748B",
+                                size=12,
+                            ),
+                        ],
+                        spacing=5,
+                        expand=True,
+                    ),
+                    ft.Container(
+                        padding=ft.Padding.symmetric(
+                            horizontal=16,
+                            vertical=11,
                         ),
-                    ],
-                    spacing=15,
-                ),
-                ft.Divider(),
-                ft.Text(
-                    "CONTROL DE PURGAS DE CALDERA",
-                    size=24,
-                    weight=ft.FontWeight.BOLD,
-                    color=COLOR_PRIMARIO,
-                ),
-                ft.Text(
-                    f"{nombre_completo} ({usuario_logueado})",
-                    color="#475569",
-                    size=12,
-                ),
-            ],
-            spacing=8,
-        ),
+                        bgcolor="#F8FAFC",
+                        border=ft.Border.all(1, "#CBD5E1"),
+                        border_radius=10,
+                        content=ft.Row(
+                            [
+                                ft.Icon(
+                                    ft.Icons.ACCESS_TIME_ROUNDED,
+                                    color=COLOR_PRIMARIO,
+                                    size=25,
+                                ),
+                                txt_reloj,
+                            ],
+                            spacing=8,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        ], spacing=8),
     )
+
     barra_fecha = ft.Container(
-        padding=16,
-        bgcolor="white",
-        border=ft.Border.all(1, COLOR_BORDE),
+        padding=16, bgcolor="white", border=ft.Border.all(1, COLOR_BORDE),
         border_radius=12,
-        content=ft.Row(
-            [
+        content=ft.Column([
+            ft.Row([
                 ft.Icon(ft.Icons.CALENDAR_MONTH_ROUNDED, color=COLOR_TITULO),
-                ft.Text(
-                    "Fecha de operación:",
-                    weight=ft.FontWeight.BOLD,
-                    color=COLOR_TITULO,
-                ),
+                ft.Text("Fecha de operación:", weight=ft.FontWeight.BOLD,
+                        color=COLOR_TITULO),
                 campo_fecha,
                 ft.IconButton(
                     icon=ft.Icons.CALENDAR_TODAY_ROUNDED,
@@ -990,11 +1297,8 @@ def abrir_ventana(
                     tooltip="Seleccionar fecha",
                     on_click=lambda _: mostrar_dialogo(selector_fecha),
                 ),
-                ft.Text(
-                    "Hora:",
-                    weight=ft.FontWeight.BOLD,
-                    color=COLOR_TITULO,
-                ),
+                ft.Text("Hora:", weight=ft.FontWeight.BOLD,
+                        color=COLOR_TITULO),
                 campo_hora,
                 ft.IconButton(
                     icon=ft.Icons.ACCESS_TIME_ROUNDED,
@@ -1002,92 +1306,102 @@ def abrir_ventana(
                     tooltip="Seleccionar hora",
                     on_click=lambda _: mostrar_dialogo(selector_hora),
                 ),
-                boton_ahora,
-            ],
-            spacing=8,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            wrap=True,
-        ),
+            ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row(
+                [boton_ahora],
+                alignment=ft.MainAxisAlignment.END,
+            ),
+        ], spacing=8),
     )
+
     introduccion = ft.Container(
-        padding=16,
-        bgcolor="#EFF6FF",
-        border=ft.Border.all(1, "#BFDBFE"),
-        border_radius=10,
-        content=ft.Row(
-            [
-                ft.Icon(ft.Icons.INFO_OUTLINE_ROUNDED, color=COLOR_PRIMARIO),
-                ft.Text(
-                    "Registra una vez cada turno por fecha. pH: 10,5–11,5; "
-                    "Alcalinidad M: máximo 500 ppm. Las desviaciones requieren "
-                    "confirmación antes del envío.",
-                    color="#1E3A8A",
-                    size=13,
-                    expand=True,
-                ),
-            ],
-            spacing=10,
-        ),
+        padding=16, bgcolor="#EFF6FF",
+        border=ft.Border.all(1, "#BFDBFE"), border_radius=10,
+        content=ft.Row([
+            ft.Icon(ft.Icons.INFO_OUTLINE_ROUNDED, color=COLOR_PRIMARIO),
+            ft.Text(
+                "Completa las dos calderas y guarda el registro como borrador. "
+                "Después podrás revisarlo, editarlo, eliminarlo o enviarlo a SQL Server.",
+                color=COLOR_PRIMARIO, size=13, expand=True,
+            ),
+        ], spacing=10),
     )
-    panel_borradores = ft.Container(
-        padding=18,
-        bgcolor="white",
-        border=ft.Border.all(1, COLOR_BORDE),
+
+    panel_registro = ft.Container(
+        padding=18, bgcolor="white", border=ft.Border.all(1, COLOR_BORDE),
         border_radius=14,
-        content=ft.Column(
-            [
-                ft.Row(
-                    [
-                        ft.Icon(
-                            ft.Icons.DRAFTS_OUTLINED,
-                            color=COLOR_PRIMARIO,
-                            size=22,
-                        ),
-                        ft.Text(
-                            "BORRADORES PENDIENTES DE ENVÍO",
-                            size=17,
-                            weight=ft.FontWeight.BOLD,
-                            color=COLOR_PRIMARIO,
-                        ),
-                    ],
-                    spacing=8,
-                ),
+        content=ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.ASSIGNMENT_OUTLINED, color=COLOR_PRIMARIO),
+                ft.Text("CAPTURA DEL REGISTRO", size=18,
+                        weight=ft.FontWeight.BOLD, color=COLOR_PRIMARIO),
+            ], spacing=8),
+            ft.Row(controls=paneles_caldera, spacing=12),
+            ft.Container(
+                padding=14,
+                bgcolor="#F8FAFC",
+                border=ft.Border.all(1, COLOR_BORDE),
+                border_radius=10,
+                content=ft.Column([
+                    ft.Row([
+                        ft.Icon(ft.Icons.ADD_COMMENT_OUTLINED,
+                                color=COLOR_PRIMARIO),
+                        ft.Text("OBSERVACIONES", weight=ft.FontWeight.BOLD,
+                                color=COLOR_TITULO),
+                    ], spacing=8),
+                    campo_observaciones,
+                ], spacing=8),
+            ),
+            estado_edicion,
+            ft.Column([
                 ft.Text(
-                    "Los borradores se conservan mientras el formulario esté "
-                    "abierto. Puedes cargarlos para editarlos, eliminarlos o "
-                    "enviar los turnos seleccionados.",
-                    size=13,
-                    color="#475569",
+                    "El borrador queda disponible para revisión antes del envío.",
+                    size=12,
+                    color="#64748B",
                 ),
-                estado_vacio,
-                columna_borradores,
                 ft.Row(
-                    [boton_enviar],
+                    [boton_guardar],
                     alignment=ft.MainAxisAlignment.END,
                 ),
-                mensaje_estado,
-            ],
-            spacing=10,
-        ),
+            ], spacing=6),
+        ], spacing=14),
     )
-    columna_principal = ft.Column(
-        [
-            encabezado,
-            barra_fecha,
-            introduccion,
-            *tarjetas_turno,
-            panel_borradores,
-        ],
-        spacing=14,
-        tight=True,
-        scroll=ft.ScrollMode.AUTO,
+
+    panel_borradores = ft.Container(
+        padding=18, bgcolor="white", border=ft.Border.all(1, COLOR_BORDE),
+        border_radius=14,
+        content=ft.Column([
+            ft.Row([
+                ft.Icon(ft.Icons.DRAFTS_OUTLINED, color=COLOR_PRIMARIO, size=22),
+                ft.Text("BORRADORES PENDIENTES DE ENVÍO", size=17,
+                        weight=ft.FontWeight.BOLD, color=COLOR_PRIMARIO),
+            ], spacing=8),
+            ft.Text(
+                "Cada borrador representa un registro completo de las dos calderas. "
+                "Selecciona los que quieras confirmar y enviar.",
+                size=13, color="#475569",
+            ),
+            estado_vacio,
+            columna_borradores,
+            ft.Row([boton_enviar], alignment=ft.MainAxisAlignment.END),
+            mensaje_estado,
+        ], spacing=10),
     )
-    contenido = ft.Container(
-        expand=True,
-        padding=10,
-        content=columna_principal,
-    )
-    page.add(contenido)
+
+    columna_principal = ft.Column([
+        encabezado,
+        barra_fecha,
+        introduccion,
+        panel_registro,
+        panel_borradores,
+    ], spacing=14, tight=True, scroll=ft.ScrollMode.AUTO)
+
+    page.add(ft.Container(
+        expand=True, padding=10, content=columna_principal,
+    ))
+
+    interfaz_lista = True
+    actualizar_lista_borradores()
     page.update()
     threading.Thread(target=animar_marquee, daemon=True).start()
     threading.Thread(target=actualizar_fecha_hora, daemon=True).start()

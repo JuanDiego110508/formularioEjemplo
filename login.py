@@ -10,49 +10,94 @@ REPORTE_FORMULARIO_19 = "mante_condensados"
 REPORTE_FORMULARIO_2 = "mante_aguas_caldera"
 REPORTE_FORMULARIO_3 = "mante_control_caldera"
 REPORTE_FORMULARIO_4 = "mante_control_agua_soda"
+
+
+REPORTES_PERMITIDOS = frozenset(
+    {
+        REPORTE_FORMULARIO_19,
+        REPORTE_FORMULARIO_2,
+        REPORTE_FORMULARIO_3,
+        REPORTE_FORMULARIO_4,
+    }
+)
+
+
 CONSULTA_USUARIO = """
-SELECT usuario, nombre, reporte
+SELECT
+    usuario,
+    nombre,
+    reporte
 FROM dbo.Maestro_Permisos_Reportes
-WHERE usuario = ? AND [contraseña] = ? AND reporte IN (?, ?, ?)
+WHERE usuario = ?
+  AND [contraseña] = ?
 ORDER BY id_maestro
 """
 
 
 def autenticar_usuario(
-    usuario: str, contraseña: str
+    usuario: str,
+    contraseña: str,
 ) -> tuple[str, str, frozenset[str]] | None:
-    usuario = usuario.strip()
-    if not usuario or not contraseña or len(contraseña) > 20:
+    usuario_limpio = (usuario or "").strip()
+    contraseña_limpia = contraseña or ""
+
+    if (
+        not usuario_limpio
+        or not contraseña_limpia
+        or len(contraseña_limpia) > 20
+    ):
         return None
 
     conn = conexion.obtener_conexion_usuarios()
+    cursor = None
+
     try:
         cursor = conn.cursor()
-        try:
-            cursor.execute(
-                CONSULTA_USUARIO,
-                usuario,
-                contraseña,
-                REPORTE_FORMULARIO_19,
-                REPORTE_FORMULARIO_2,
-                REPORTE_FORMULARIO_3,
-                REPORTE_FORMULARIO_4,
-            )
-            filas = cursor.fetchall()
-        finally:
-            cursor.close()
+
+        cursor.execute(
+            CONSULTA_USUARIO,
+            usuario_limpio,
+            contraseña_limpia,
+        )
+
+        filas = cursor.fetchall()
+
     finally:
+        if cursor is not None:
+            cursor.close()
+
         conn.close()
 
     if not filas:
         return None
 
-    fila = filas[0]
-    usuario_validado = str(fila[0])
-    nombre = str(fila[1]).strip() if fila[1] else usuario_validado
-    reportes = frozenset(str(registro[2]) for registro in filas)
-    return usuario_validado, nombre, reportes
+    reportes_usuario = frozenset(
+        str(fila[2]).strip()
+        for fila in filas
+        if fila[2] is not None
+    )
 
+    reportes_autorizados = reportes_usuario.intersection(
+        REPORTES_PERMITIDOS
+    )
+
+    if not reportes_autorizados:
+        return None
+
+    primera_fila = filas[0]
+    usuario_validado = str(primera_fila[0]).strip()
+
+    nombre = (
+        str(primera_fila[1]).strip()
+        if primera_fila[1]
+        else usuario_validado
+    )
+
+    return (
+        usuario_validado,
+        nombre,
+        reportes_autorizados,
+    )
 
 def crear_login(page: ft.Page, al_autenticar):
     page.controls.clear()
