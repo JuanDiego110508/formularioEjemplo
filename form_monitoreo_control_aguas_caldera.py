@@ -574,19 +574,28 @@ def insertar_registro_bd(
                 )
             id_registro = int(fila_insertada[0])
         else:
-            asignaciones = ", ".join(
+            asignaciones_mediciones = ", ".join(
                 f"{columna} = ?" for columna in columnas_seleccionadas
             )
             cursor.execute(
                 f"""
                 UPDATE {TABLA_REGISTRO}
-                SET {asignaciones}
+                SET 
+                    {asignaciones_mediciones},
+                    hora = ?,
+                    analizo = ?,
+                    usuario_registro = ?,
+                    observaciones = ?
                 WHERE id_registro = ?
                 """,
                 *(
                     valores_por_columna[columna]
                     for columna in columnas_seleccionadas
                 ),
+                hora_sql.strftime("%H:%M:%S"),
+                analizo,
+                usuario_registro,
+                observaciones or None,
                 int(fila[0]),
             )
             id_registro = int(fila[0])
@@ -774,13 +783,35 @@ def abrir_ventana(
                                 spacing=3,
                                 expand=True,
                             ),
-                            ft.IconButton(
-                                icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
-                                icon_color="#B91C1C",
-                                tooltip="Descartar borrador",
-                                on_click=lambda _, sid=seccion_id: descartar_borrador(
-                                    sid
-                                ),
+                            ft.Row(
+                                [
+                                    ft.IconButton(
+                                        icon=ft.Icons.VISIBILITY_OUTLINED,
+                                        icon_color=COLOR_PRIMARIO,
+                                        tooltip="Visualizar borrador",
+                                        on_click=lambda _, sid=seccion_id: visualizar_borrador(
+                                            sid
+                                        ),
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.EDIT_OUTLINED,
+                                        icon_color="#D97706",
+                                        tooltip="Editar borrador",
+                                        on_click=lambda _, sid=seccion_id: editar_borrador(
+                                            sid
+                                        ),
+                                    ),
+                                    ft.IconButton(
+                                        icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                                        icon_color="#B91C1C",
+                                        tooltip="Descartar borrador",
+                                        on_click=lambda _, sid=seccion_id: descartar_borrador(
+                                            sid
+                                        ),
+                                    ),
+                                ],
+                                spacing=0,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
                         ],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -836,11 +867,51 @@ def abrir_ventana(
                     control.color = "#B91C1C"
         page.update()
 
-    tarjetas_seccion = []
+    # Secciones plegables. Se evita combinar wrap=True con expand=True.
+    tarjetas_seccion: list[ft.Container] = []
+    contenidos_seccion: dict[str, ft.Container] = {}
+    botones_expansion: dict[str, ft.IconButton] = {}
+    resumenes_seccion: dict[str, ft.Text] = {}
+    secciones_expandidas: dict[str, bool] = {
+        seccion["id"]: seccion["id"] == "ALIMENTACION_CALDERA"
+        for seccion in SECCIONES
+    }
+
+    def actualizar_resumen_seccion(seccion_id: str):
+        seccion = next(item for item in SECCIONES if item["id"] == seccion_id)
+        diligenciados = sum(
+            1
+            for parametro in seccion["parametros"]
+            if (entradas[(seccion_id, parametro["id"])].value or "").strip()
+        )
+        total = len(seccion["parametros"])
+        resumenes_seccion[seccion_id].value = (
+            "Sin diligenciar"
+            if diligenciados == 0
+            else "Sección completa"
+            if diligenciados == total
+            else f"{diligenciados} de {total} campos diligenciados"
+        )
+
+    def alternar_seccion(seccion_id: str):
+        expandida = not secciones_expandidas[seccion_id]
+        secciones_expandidas[seccion_id] = expandida
+        contenidos_seccion[seccion_id].visible = expandida
+        botones_expansion[seccion_id].icon = (
+            ft.Icons.KEYBOARD_ARROW_UP_ROUNDED
+            if expandida
+            else ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED
+        )
+        botones_expansion[seccion_id].tooltip = (
+            "Contraer sección" if expandida else "Expandir sección"
+        )
+        page.update()
+
     for seccion in SECCIONES:
+        seccion_id = seccion["id"]
         tarjetas_parametros = []
         for parametro in seccion["parametros"]:
-            clave = (seccion["id"], parametro["id"])
+            clave = (seccion_id, parametro["id"])
             estado = ft.Text("Requerido", size=11, color="#64748B")
             campo = ft.TextField(
                 label=f"Lectura ({parametro['unidad']})",
@@ -899,7 +970,7 @@ def abrir_ventana(
             size=12,
             color="#475569",
         )
-        estados_borrador[seccion["id"]] = estado_seccion
+        estados_borrador[seccion_id] = estado_seccion
         boton_borrador = ft.OutlinedButton(
             "Guardar sección como borrador",
             icon=ft.Icons.DRAFTS_OUTLINED,
@@ -910,7 +981,108 @@ def abrir_ventana(
                 padding=ft.Padding.symmetric(horizontal=16, vertical=12),
             ),
         )
-        botones_borrador[seccion["id"]] = boton_borrador
+        botones_borrador[seccion_id] = boton_borrador
+
+        resumen = ft.Text(
+            "Sin diligenciar",
+            size=12,
+            color="#64748B",
+            weight=ft.FontWeight.W_500,
+        )
+        resumenes_seccion[seccion_id] = resumen
+        boton_expandir = ft.IconButton(
+            icon=(
+                ft.Icons.KEYBOARD_ARROW_UP_ROUNDED
+                if secciones_expandidas[seccion_id]
+                else ft.Icons.KEYBOARD_ARROW_DOWN_ROUNDED
+            ),
+            icon_color=seccion["color"],
+            tooltip=(
+                "Contraer sección"
+                if secciones_expandidas[seccion_id]
+                else "Expandir sección"
+            ),
+            on_click=lambda _, sid=seccion_id: alternar_seccion(sid),
+        )
+        botones_expansion[seccion_id] = boton_expandir
+
+        contenido = ft.Container(
+            visible=secciones_expandidas[seccion_id],
+            padding=ft.Padding.only(top=12),
+            content=ft.Column(
+                [
+                    ft.Row(
+                        controls=tarjetas_parametros,
+                        spacing=10,
+                        run_spacing=10,
+                        wrap=True,
+                    ),
+                    estado_seccion,
+                    ft.Row(
+                        [boton_borrador],
+                        alignment=ft.MainAxisAlignment.END,
+                    ),
+                ],
+                spacing=10,
+                tight=True,
+            ),
+        )
+        contenidos_seccion[seccion_id] = contenido
+
+        encabezado_seccion = ft.Container(
+            padding=ft.Padding.symmetric(horizontal=4, vertical=2),
+            on_click=lambda _, sid=seccion_id: alternar_seccion(sid),
+            content=ft.Row(
+                [
+                    ft.Container(
+                        width=42,
+                        height=42,
+                        alignment=ft.Alignment.CENTER,
+                        bgcolor=seccion["color_suave"],
+                        border_radius=11,
+                        content=ft.Icon(
+                            seccion["icono"],
+                            color=seccion["color"],
+                            size=24,
+                        ),
+                    ),
+                    ft.Column(
+                        [
+                            ft.Text(
+                                seccion["titulo"],
+                                size=17,
+                                weight=ft.FontWeight.BOLD,
+                                color=COLOR_TITULO,
+                            ),
+                            ft.Row(
+                                [
+                                    ft.Text(
+                                        seccion["subtitulo"],
+                                        size=12,
+                                        color="#475569",
+                                    ),
+                                    ft.Text("·", size=12, color="#94A3B8"),
+                                    resumen,
+                                ],
+                                spacing=6,
+                                wrap=True,
+                            ),
+                        ],
+                        spacing=3,
+                        expand=True,
+                    ),
+                    ft.Text(
+                        f"{len(seccion['parametros'])} parámetros",
+                        size=12,
+                        color=seccion["color"],
+                        weight=ft.FontWeight.BOLD,
+                    ),
+                    boton_expandir,
+                ],
+                spacing=12,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            ),
+        )
 
         tarjetas_seccion.append(
             ft.Container(
@@ -919,88 +1091,37 @@ def abrir_ventana(
                 border=ft.Border.all(1, COLOR_BORDE),
                 border_radius=14,
                 content=ft.Column(
-                    [
-                        ft.Row(
-                            [
-                                ft.Container(
-                                    width=42,
-                                    height=42,
-                                    alignment=ft.Alignment.CENTER,
-                                    bgcolor=seccion["color_suave"],
-                                    border_radius=11,
-                                    content=ft.Icon(
-                                        seccion["icono"],
-                                        color=seccion["color"],
-                                        size=24,
-                                    ),
-                                ),
-                                ft.Column(
-                                    [
-                                        ft.Text(
-                                            seccion["titulo"],
-                                            size=17,
-                                            weight=ft.FontWeight.BOLD,
-                                            color=COLOR_TITULO,
-                                        ),
-                                        ft.Text(
-                                            seccion["subtitulo"],
-                                            size=12,
-                                            color="#475569",
-                                        ),
-                                    ],
-                                    spacing=2,
-                                    expand=True,
-                                ),
-                                ft.Text(
-                                    f"{len(seccion['parametros'])} parámetros",
-                                    size=12,
-                                    color=seccion["color"],
-                                    weight=ft.FontWeight.BOLD,
-                                ),
-                            ],
-                            spacing=12,
-                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        ),
-                        ft.Row(
-                            controls=tarjetas_parametros,
-                            spacing=10,
-                            run_spacing=10,
-                            wrap=True,
-                        ),
-                        ft.Column(
-                            [
-                                estado_seccion,
-                                ft.Row(
-                                    [boton_borrador],
-                                    alignment=ft.MainAxisAlignment.END,
-                                ),
-                            ],
-                            spacing=8,
-                        ),
-                    ],
-                    spacing=12,
+                    [encabezado_seccion, contenido],
+                    spacing=0,
+                    tight=True,
                 ),
             )
         )
 
-    campo_analizo = ft.TextField(
-        label="Analizó",
-        value=nombre_completo,
-        max_length=100,
-        width=320,
-        prefix_icon=ft.Icons.PERSON_OUTLINE,
-        color="#334155",
-        label_style=ft.TextStyle(color="#475569"),
-    )
+    # "Analizó" se toma automáticamente del usuario autenticado.
+    analizo_automatico = (nombre_completo or usuario_logueado or "").strip()
+
+    # Campo interno: se edita mediante el diálogo de Observaciones.
     campo_observaciones = ft.TextField(
         label="Observaciones",
-        hint_text="Notas de la medición diaria",
+        hint_text="Escribe las observaciones de la medición diaria",
         multiline=True,
-        min_lines=2,
-        max_lines=4,
+        min_lines=5,
+        max_lines=8,
         max_length=1000,
         color="#334155",
+        bgcolor="white",
+        border_color="#CBD5E1",
+        focused_border_color=COLOR_PRIMARIO,
+        cursor_color=COLOR_PRIMARIO,
         label_style=ft.TextStyle(color="#475569"),
+        hint_style=ft.TextStyle(color="#94A3B8"),
+        border_radius=10,
+    )
+    texto_estado_observacion = ft.Text(
+        "Sin observaciones guardadas",
+        size=12,
+        color="#64748B",
     )
     mensaje_estado = ft.Text("", visible=False, size=13)
     def mostrar_dialogo(dialogo):
@@ -1018,9 +1139,305 @@ def abrir_ventana(
             page.dialog.open = False
             page.update()
 
+    def visualizar_borrador(seccion_id: str):
+        borrador = borradores.get(seccion_id)
+        seccion = next(
+            (item for item in SECCIONES if item["id"] == seccion_id),
+            None,
+        )
+        if borrador is None or seccion is None:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("El borrador ya no está disponible."),
+                bgcolor="#B91C1C",
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        parametros = {
+            parametro["id"]: parametro
+            for parametro in seccion["parametros"]
+        }
+        filas_lecturas = []
+        for _, parametro_id, valor in borrador["lecturas"]:
+            parametro = parametros[parametro_id]
+            cumple = evaluar_criterio(valor, parametro["regla"])
+            color_estado = (
+                "#15803D" if cumple is True
+                else "#B91C1C" if cumple is False
+                else "#475569"
+            )
+            texto_estado = (
+                "Dentro del control" if cumple is True
+                else "Fuera del control" if cumple is False
+                else "Sin criterio"
+            )
+            filas_lecturas.append(
+                ft.Container(
+                    padding=ft.Padding.symmetric(horizontal=12, vertical=9),
+                    bgcolor="white",
+                    border=ft.Border.all(1, COLOR_BORDE),
+                    border_radius=8,
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(
+                                        parametro["nombre"],
+                                        weight=ft.FontWeight.BOLD,
+                                        color=COLOR_TITULO,
+                                    ),
+                                    ft.Text(
+                                        f"Control: {parametro['control']}",
+                                        size=11,
+                                        color="#64748B",
+                                    ),
+                                ],
+                                spacing=2,
+                                expand=True,
+                            ),
+                            ft.Text(
+                                f"{valor} {parametro['unidad']}",
+                                weight=ft.FontWeight.BOLD,
+                                color=COLOR_TITULO,
+                            ),
+                            ft.Text(
+                                texto_estado,
+                                size=11,
+                                color=color_estado,
+                                weight=ft.FontWeight.W_500,
+                            ),
+                        ],
+                        spacing=12,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                )
+            )
+
+        observacion = borrador.get("observaciones") or "Sin observaciones"
+        dialogo = ft.AlertDialog(
+            modal=True,
+            bgcolor="white",
+            title=ft.Row(
+                [
+                    ft.Icon(ft.Icons.VISIBILITY_OUTLINED, color=seccion["color"]),
+                    ft.Text(
+                        f"Vista previa · {seccion['titulo']}",
+                        weight=ft.FontWeight.BOLD,
+                        color=COLOR_TITULO,
+                    ),
+                ],
+                spacing=8,
+            ),
+            content=ft.Container(
+                width=680,
+                height=520,
+                bgcolor="white",
+                content=ft.Column(
+                    [
+                        ft.Container(
+                            padding=12,
+                            bgcolor=seccion["color_suave"],
+                            border_radius=9,
+                            content=ft.Column(
+                                [
+                                    ft.Text(
+                                        f"Fecha: {borrador['fecha']}   ·   Hora: {borrador['hora']}",
+                                        weight=ft.FontWeight.BOLD,
+                                        color=COLOR_TITULO,
+                                    ),
+                                    ft.Text(
+                                        f"Responsable: {borrador['analizo']}",
+                                        size=12,
+                                        color="#475569",
+                                    ),
+                                ],
+                                spacing=3,
+                            ),
+                        ),
+                        *filas_lecturas,
+                        ft.Container(
+                            padding=12,
+                            bgcolor="#F8FAFC",
+                            border=ft.Border.all(1, COLOR_BORDE),
+                            border_radius=8,
+                            content=ft.Column(
+                                [
+                                    ft.Text(
+                                        "Observaciones",
+                                        weight=ft.FontWeight.BOLD,
+                                        color=COLOR_TITULO,
+                                    ),
+                                    ft.Text(observacion, color="#475569"),
+                                ],
+                                spacing=4,
+                            ),
+                        ),
+                    ],
+                    spacing=8,
+                    scroll=ft.ScrollMode.AUTO,
+                ),
+            ),
+            actions=[
+                ft.OutlinedButton(
+                    "Cerrar",
+                    on_click=lambda _: cerrar_dialogo(dialogo),
+                ),
+                ft.ElevatedButton(
+                    "Editar borrador",
+                    icon=ft.Icons.EDIT_OUTLINED,
+                    bgcolor=COLOR_PRIMARIO,
+                    color="white",
+                    on_click=lambda _: editar_desde_vista(dialogo, seccion_id),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        mostrar_dialogo(dialogo)
+
+    def editar_desde_vista(dialogo, seccion_id: str):
+        cerrar_dialogo(dialogo)
+        editar_borrador(seccion_id)
+
+    def editar_borrador(seccion_id: str):
+        nonlocal fecha_fijada, hora_fijada
+        borrador = borradores.get(seccion_id)
+        seccion = next(
+            (item for item in SECCIONES if item["id"] == seccion_id),
+            None,
+        )
+        if borrador is None or seccion is None:
+            page.snack_bar = ft.SnackBar(
+                ft.Text("El borrador ya no está disponible."),
+                bgcolor="#B91C1C",
+            )
+            page.snack_bar.open = True
+            page.update()
+            return
+
+        valores = {
+            parametro_id: valor
+            for _, parametro_id, valor in borrador["lecturas"]
+        }
+        for parametro in seccion["parametros"]:
+            campo = entradas[(seccion_id, parametro["id"])]
+            valor = valores.get(parametro["id"])
+            campo.value = "" if valor is None else str(valor)
+            actualizar_estado_lectura(seccion, parametro, campo)
+
+        # Conserva la fecha original del borrador, pero la hora vuelve
+        # automáticamente al momento actual para evitar guardar una hora antigua.
+        fecha_fijada = borrador["fecha"]
+        hora_fijada = None
+        momento_actual = datetime.datetime.now()
+        txt_fecha.value = fecha_fijada
+        txt_hora.value = momento_actual.strftime("%H:%M:%S")
+        btn_actualizar_ahora.visible = True
+
+        campo_observaciones.value = borrador.get("observaciones") or ""
+        if campo_observaciones.value:
+            texto_estado_observacion.value = (
+                f"Observación guardada · {len(campo_observaciones.value)} caracteres"
+            )
+            texto_estado_observacion.color = "#15803D"
+        else:
+            texto_estado_observacion.value = "Sin observaciones guardadas"
+            texto_estado_observacion.color = "#64748B"
+
+        if not secciones_expandidas[seccion_id]:
+            secciones_expandidas[seccion_id] = True
+            contenidos_seccion[seccion_id].visible = True
+            botones_expansion[seccion_id].icon = ft.Icons.KEYBOARD_ARROW_UP_ROUNDED
+            botones_expansion[seccion_id].tooltip = "Contraer sección"
+
+        actualizar_resumen_seccion(seccion_id)
+        estado = estados_borrador[seccion_id]
+        estado.value = (
+            "Borrador cargado para edición. Se conservó la fecha y la hora "
+            "volvió automáticamente a la actual. Modifica los valores y "
+            "guarda la sección para actualizarlo."
+        )
+        estado.color = "#D97706"
+        page.snack_bar = ft.SnackBar(
+            ft.Text(
+                f"Borrador de {seccion['titulo']} cargado para edición."
+            ),
+            bgcolor="#D97706",
+        )
+        page.snack_bar.open = True
+        page.update()
+
+    def abrir_observaciones(_):
+        campo_observaciones.value = campo_observaciones.value or ""
+        dialogo_observaciones = ft.AlertDialog(
+            modal=True,
+            bgcolor="white",
+            title=ft.Row(
+                [
+                    ft.Icon(ft.Icons.NOTES_ROUNDED, color=COLOR_PRIMARIO),
+                    ft.Text(
+                        "Observaciones",
+                        weight=ft.FontWeight.BOLD,
+                        color=COLOR_TITULO,
+                    ),
+                ],
+                spacing=8,
+            ),
+            content=ft.Container(
+                width=620,
+                content=campo_observaciones,
+            ),
+            actions=[
+                ft.OutlinedButton(
+                    "Cancelar",
+                    on_click=lambda _: cerrar_dialogo(dialogo_observaciones),
+                ),
+                ft.ElevatedButton(
+                    "Guardar observación",
+                    icon=ft.Icons.SAVE_OUTLINED,
+                    bgcolor=COLOR_PRIMARIO,
+                    color="white",
+                    on_click=lambda _: guardar_observacion(dialogo_observaciones),
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        mostrar_dialogo(dialogo_observaciones)
+
+    def guardar_observacion(dialogo):
+        observacion = (campo_observaciones.value or "").strip()
+        campo_observaciones.value = observacion
+        if observacion:
+            texto_estado_observacion.value = (
+                f"Observación guardada · {len(observacion)} caracteres"
+            )
+            texto_estado_observacion.color = "#15803D"
+        else:
+            texto_estado_observacion.value = "Sin observaciones guardadas"
+            texto_estado_observacion.color = "#64748B"
+
+        for borrador in borradores.values():
+            borrador["observaciones"] = observacion
+
+        cerrar_dialogo(dialogo)
+        actualizar_lista_borradores()
+        page.update()
+
+    boton_observaciones = ft.OutlinedButton(
+        "Observaciones",
+        icon=ft.Icons.NOTES_ROUNDED,
+        on_click=abrir_observaciones,
+        style=ft.ButtonStyle(
+            color=COLOR_PRIMARIO,
+            side=ft.BorderSide(1, COLOR_PRIMARIO),
+            shape=ft.RoundedRectangleBorder(radius=9),
+            padding=ft.Padding.symmetric(horizontal=18, vertical=14),
+        ),
+    )
+
     def guardar_borrador_confirmado(seccion, lecturas):
         seccion_id = seccion["id"]
-        analizo = (campo_analizo.value or "").strip()
+        analizo = analizo_automatico
         if not analizo:
             estado = estados_borrador[seccion_id]
             estado.value = "Ingresa el nombre de quien analizó."
@@ -1174,12 +1591,28 @@ def abrir_ventana(
             ]
             validar_lecturas_seleccionadas(lecturas, secciones_a_enviar)
             primer_borrador = borradores_a_enviar[0]
+
+            observaciones_registro = (
+                campo_observaciones.value or ""
+            ).strip()
+
+            if not observaciones_registro:
+                for borrador in borradores_a_enviar:
+                    observacion_borrador = (
+                        borrador.get("observaciones") or ""
+                    ).strip()
+
+                    if observacion_borrador:
+                        observaciones_registro = observacion_borrador
+                        break
+            
+
             id_registro = insertar_registro_bd(
                 primer_borrador["fecha"],
                 primer_borrador["hora"],
                 primer_borrador["analizo"],
                 usuario_logueado,
-                primer_borrador["observaciones"],
+                observaciones_registro,
                 lecturas,
                 secciones_a_enviar,
             )
@@ -1437,10 +1870,19 @@ def abrir_ventana(
                 break
             time.sleep(0.08)
 
+    txt_reloj_encabezado = ft.Text(
+        ahora.strftime("%H:%M:%S"),
+        size=17,
+        color=COLOR_PRIMARIO,
+        weight=ft.FontWeight.BOLD,
+    )
+
     def actualizar_fecha_hora():
         while formulario_activo:
             try:
                 momento = datetime.datetime.now()
+                txt_reloj_encabezado.value = momento.strftime("%H:%M:%S")
+                txt_reloj_encabezado.update()
                 if not fecha_fijada:
                     txt_fecha.value = momento.strftime("%Y-%m-%d")
                     txt_fecha.update()
@@ -1510,7 +1952,40 @@ def abrir_ventana(
                             spacing=4,
                             expand=True,
                         ),
+                        ft.Column(
+                            [
+                                ft.Row(
+                                    [
+                                        ft.Icon(
+                                            ft.Icons.ACCESS_TIME_ROUNDED,
+                                            color=COLOR_PRIMARIO,
+                                            size=24,
+                                        ),
+                                        txt_reloj_encabezado,
+                                    ],
+                                    spacing=7,
+                                    alignment=ft.MainAxisAlignment.CENTER,
+                                ),
+                                ft.Container(
+                                    padding=ft.Padding.symmetric(
+                                        horizontal=14, vertical=7
+                                    ),
+                                    border=ft.Border.all(1.5, COLOR_PRIMARIO),
+                                    border_radius=9,
+                                    alignment=ft.Alignment.CENTER,
+                                    content=ft.Text(
+                                        "FMAN-42",
+                                        size=15,
+                                        weight=ft.FontWeight.BOLD,
+                                        color=COLOR_PRIMARIO,
+                                    ),
+                                ),
+                            ],
+                            spacing=6,
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
                     ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 ),
             ],
@@ -1694,14 +2169,16 @@ def abrir_ventana(
                     content=ft.Column(
                         [
                             ft.Text(
-                                "Responsable y observaciones",
+                                "Observaciones de la medición",
                                 size=17,
                                 weight=ft.FontWeight.BOLD,
                                 color=COLOR_TITULO,
                             ),
-                            ft.Column(
-                                [campo_analizo, campo_observaciones],
-                                spacing=10,
+                            ft.Row(
+                                [boton_observaciones, texto_estado_observacion],
+                                spacing=12,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                wrap=True,
                             ),
                             ft.Text(
                                 "La frecuencia de verificación y los campos de "

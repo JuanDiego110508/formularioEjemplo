@@ -67,6 +67,7 @@ COLUMNAS_REGISTRO = (
     "hora",
     *COLUMNAS_MEDICION,
     "usuario_registro",
+    "observaciones",
 )
 
 CAMPOS_NUMERICOS = frozenset(
@@ -308,12 +309,12 @@ def insertar_borradores_bd(
         conn = conexionform.obtener_conexion_formulario()
         cursor = conn.cursor()
 
-        for (
+        for borrador, (
             fecha_sql,
             hora_sql,
             valores,
             usuario,
-        ) in registros_validados:
+        ) in zip(borradores, registros_validados):
             parametros = (
                 fecha_sql.isoformat(),
                 hora_sql.strftime("%H:%M:%S"),
@@ -322,6 +323,7 @@ def insertar_borradores_bd(
                     for columna in COLUMNAS_MEDICION
                 ),
                 usuario,
+                borrador.observaciones.strip() or None,
             )
 
             cursor.execute(
@@ -1004,11 +1006,12 @@ def abrir_ventana(
     # OBSERVACIONES MEDIANTE BOTÓN Y DIÁLOGO
     # ========================================================
 
+    # Estado independiente del TextField. Esta es la fuente de verdad.
+    estado_observacion = {"valor": ""}
+
     campo_observaciones = ft.TextField(
         label="Observaciones del registro",
-        hint_text=(
-            "Novedades, desviaciones o acciones realizadas..."
-        ),
+        hint_text="Novedades, desviaciones o acciones realizadas...",
         multiline=True,
         min_lines=5,
         max_lines=8,
@@ -1021,9 +1024,7 @@ def abrir_ventana(
         bgcolor="white",
         color="#334155",
         text_size=13,
-        label_style=ft.TextStyle(
-            color="#475569",
-        ),
+        label_style=ft.TextStyle(color="#475569"),
         content_padding=ft.Padding.all(14),
     )
 
@@ -1040,137 +1041,92 @@ def abrir_ventana(
     )
 
     def actualizar_estado_observaciones():
-        observaciones = (
-            campo_observaciones.value or ""
-        ).strip()
+        observacion = estado_observacion["valor"].strip()
 
-        if observaciones:
+        if observacion:
             texto_estado_observaciones.value = (
-                "Observaciones registradas"
+                f"Observación guardada · {len(observacion)} caracteres"
             )
             texto_estado_observaciones.color = COLOR_EXITO
-            icono_estado_observaciones.name = (
-                ft.Icons.CHECK_CIRCLE_ROUNDED
-            )
+            icono_estado_observaciones.name = ft.Icons.CHECK_CIRCLE_ROUNDED
             icono_estado_observaciones.color = COLOR_EXITO
         else:
-            texto_estado_observaciones.value = (
-                "Sin observaciones"
-            )
+            texto_estado_observaciones.value = "Sin observaciones"
             texto_estado_observaciones.color = "#64748B"
-            icono_estado_observaciones.name = (
-                ft.Icons.NOTES_ROUNDED
+            icono_estado_observaciones.name = ft.Icons.NOTES_ROUNDED
+            icono_estado_observaciones.color = COLOR_PRIMARIO
+
+    def cancelar_observacion(dialogo):
+        campo_observaciones.value = estado_observacion["valor"]
+        cerrar_dialogo(dialogo)
+
+    def guardar_observacion(dialogo):
+        observacion = (campo_observaciones.value or "").strip()
+
+        if len(observacion) > 1000:
+            mostrar_mensaje(
+                "Las observaciones admiten máximo 1000 caracteres.",
+                COLOR_ERROR,
             )
-            icono_estado_observaciones.color = (
-                COLOR_PRIMARIO
+            return
+
+        estado_observacion["valor"] = observacion
+        campo_observaciones.value = observacion
+        actualizar_estado_observaciones()
+
+        # BorradorRegistro es inmutable, por eso se reemplaza cada objeto
+        # conservando su identificador y sus valores.
+        for indice, borrador_existente in enumerate(borradores):
+            borradores[indice] = BorradorRegistro(
+                id_temporal=borrador_existente.id_temporal,
+                fecha=borrador_existente.fecha,
+                hora=borrador_existente.hora,
+                usuario_registro=borrador_existente.usuario_registro,
+                valores=dict(borrador_existente.valores),
+                observaciones=observacion,
             )
+
+        cerrar_dialogo(dialogo)
+        actualizar_lista_borradores()
+        page.update()
 
     def abrir_observaciones(_):
-        valor_original = campo_observaciones.value or ""
-
-        def guardar_observaciones(_):
-            valor = (
-                campo_observaciones.value or ""
-            ).strip()
-
-            if len(valor) > 1000:
-                mostrar_mensaje(
-                    "Las observaciones admiten máximo "
-                    "1000 caracteres.",
-                    COLOR_ERROR,
-                )
-                return
-
-            campo_observaciones.value = valor
-            actualizar_estado_observaciones()
-            cerrar_dialogo(dialogo_observaciones)
-            page.update()
-
-        def cancelar_observaciones(_):
-            campo_observaciones.value = valor_original
-            cerrar_dialogo(dialogo_observaciones)
+        campo_observaciones.value = estado_observacion["valor"]
 
         dialogo_observaciones = ft.AlertDialog(
             modal=True,
             bgcolor="white",
             title=ft.Row(
                 [
-                    ft.Container(
-                        width=42,
-                        height=42,
-                        alignment=ft.Alignment.CENTER,
-                        bgcolor="#EFF6FF",
-                        border_radius=10,
-                        content=ft.Icon(
-                            ft.Icons.ADD_COMMENT_OUTLINED,
-                            color=COLOR_PRIMARIO,
-                            size=22,
-                        ),
-                    ),
-                    ft.Column(
-                        [
-                            ft.Text(
-                                "Observaciones",
-                                size=18,
-                                weight=ft.FontWeight.BOLD,
-                                color=COLOR_PRIMARIO,
-                            ),
-                            ft.Text(
-                                "Registra novedades o acciones "
-                                "realizadas.",
-                                size=12,
-                                color="#64748B",
-                            ),
-                        ],
-                        spacing=1,
+                    ft.Icon(ft.Icons.NOTES_ROUNDED, color=COLOR_PRIMARIO),
+                    ft.Text(
+                        "Observaciones",
+                        weight=ft.FontWeight.BOLD,
+                        color=COLOR_TITULO,
                     ),
                 ],
-                spacing=10,
+                spacing=8,
             ),
             content=ft.Container(
-                width=650,
-                content=ft.Column(
-                    [
-                        ft.Container(
-                            padding=12,
-                            bgcolor="#F8FAFC",
-                            border=ft.Border.all(
-                                1,
-                                COLOR_BORDE,
-                            ),
-                            border_radius=10,
-                            content=campo_observaciones,
-                        ),
-                        ft.Text(
-                            "Este campo es opcional y se conserva "
-                            "dentro del borrador del registro.",
-                            size=11,
-                            color="#64748B",
-                        ),
-                    ],
-                    spacing=8,
-                    tight=True,
-                ),
+                width=620,
+                bgcolor="white",
+                content=campo_observaciones,
             ),
             actions=[
                 ft.OutlinedButton(
                     "Cancelar",
-                    icon=ft.Icons.CLOSE_ROUNDED,
-                    on_click=cancelar_observaciones,
-                    style=ft.ButtonStyle(
-                        color="#475569",
-                        side=ft.BorderSide(
-                            1,
-                            "#CBD5E1",
-                        ),
+                    on_click=lambda _: cancelar_observacion(
+                        dialogo_observaciones
                     ),
                 ),
                 ft.ElevatedButton(
-                    "Guardar observaciones",
+                    "Guardar observación",
                     icon=ft.Icons.SAVE_OUTLINED,
                     bgcolor=COLOR_PRIMARIO,
                     color="white",
-                    on_click=guardar_observaciones,
+                    on_click=lambda _: guardar_observacion(
+                        dialogo_observaciones
+                    ),
                 ),
             ],
             actions_alignment=ft.MainAxisAlignment.END,
@@ -1194,26 +1150,12 @@ def abrir_ventana(
                 ft.ControlState.PRESSED: "#DBEAFE",
             },
             side={
-                ft.ControlState.DEFAULT: ft.BorderSide(
-                    1,
-                    "#CBD5E1"
-                ),
-                ft.ControlState.HOVERED: ft.BorderSide(
-                    1,
-                    "#93C5FD",
-                ),
-                ft.ControlState.PRESSED: ft.BorderSide(
-                    1,
-                    COLOR_PRIMARIO,
-                ),
+                ft.ControlState.DEFAULT: ft.BorderSide(1, "#CBD5E1"),
+                ft.ControlState.HOVERED: ft.BorderSide(1, "#93C5FD"),
+                ft.ControlState.PRESSED: ft.BorderSide(1, COLOR_PRIMARIO),
             },
-            padding=ft.Padding.symmetric(
-                horizontal=13,
-                vertical=9,
-            ),
-            shape=ft.RoundedRectangleBorder(
-                radius=8,
-            ),
+            padding=ft.Padding.symmetric(horizontal=13, vertical=9),
+            shape=ft.RoundedRectangleBorder(radius=8),
         ),
     )
 
@@ -1323,6 +1265,7 @@ def abrir_ventana(
             control.value = ""
 
         campo_observaciones.value = ""
+        estado_observacion["valor"] = ""
         id_borrador_en_edicion = None
 
         actualizar_estado_observaciones()
@@ -2055,9 +1998,10 @@ def abrir_ventana(
             if nombre in campos:
                 campos[nombre].value = str(valor)
 
-        campo_observaciones.value = (
-            borrador.observaciones
-        )
+        estado_observacion["valor"] = (
+            borrador.observaciones or ""
+        ).strip()
+        campo_observaciones.value = estado_observacion["valor"]
         actualizar_estado_observaciones()
 
         boton_guardar.text = "Actualizar borrador"
@@ -2107,9 +2051,7 @@ def abrir_ventana(
     ):
         nonlocal id_borrador_en_edicion
 
-        observaciones = (
-            campo_observaciones.value or ""
-        ).strip()
+        observaciones = estado_observacion["valor"].strip()
 
         if id_borrador_en_edicion is None:
             id_temporal = uuid4().hex

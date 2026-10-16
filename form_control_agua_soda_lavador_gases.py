@@ -56,6 +56,7 @@ class LecturaRegistro:
     consumo_soda: Decimal
     responsable: str
     usuario_registro: str
+    observaciones: str = ""
 
 
 # Alias conservado para no romper importaciones antiguas que usen este nombre.
@@ -117,6 +118,7 @@ def validar_lectura(
     consumo_soda: str | None,
     responsable: str | None,
     usuario_registro: str,
+    observaciones: str = "",
     id_temporal: str | None = None,
 ) -> LecturaRegistro:
     try:
@@ -155,6 +157,7 @@ def validar_lectura(
         consumo_soda=parsear_decimal(consumo_soda, "Consumo de soda caustica"),
         responsable=responsable_limpio,
         usuario_registro=usuario_limpio,
+        observaciones=(observaciones or "").strip(),
     )
 
 
@@ -254,7 +257,7 @@ def insertar_registros_bd(
                 _decimal_sql(registro.consumo_soda),
                 registro.responsable,
                 registro.usuario_registro,
-                observaciones or None,
+                (registro.observaciones or observaciones) or None,
             )
             fila = cursor.fetchone()
             if fila is None:
@@ -283,6 +286,15 @@ def abrir_ventana(
     page.controls.clear()
     page.title = f"Formulario 4 - {CODIGO_FORMULARIO}"
     page.bgcolor = COLOR_FONDO
+
+    # Tema blanco para toda la superficie exterior e interior de los diálogos.
+    if page.theme is None:
+        page.theme = ft.Theme()
+    page.theme.dialog_theme = ft.DialogTheme(
+        bgcolor="white",
+        shadow_color="#94A3B8",
+        shape=ft.RoundedRectangleBorder(radius=14),
+    )
     page.window.maximized = True
     page.window.resizable = True
 
@@ -290,6 +302,7 @@ def abrir_ventana(
     pagina_lista = False
     fecha_fijada: str | None = None
     hora_fijada: str | None = None
+    id_registro_en_edicion: str | None = None
     registros_pendientes: list[LecturaRegistro] = []
     historicos: list[dict[str, Any]] = []
 
@@ -334,11 +347,15 @@ def abrir_ventana(
         value=ahora.strftime("%Y-%m-%d"), read_only=True, width=150, height=45,
         content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
         border_radius=8, border_color="#CBD5E1", text_size=13,
+        color="#475569",
+        text_style=ft.TextStyle(color="#475569", weight=ft.FontWeight.W_500),
     )
     txt_hora = ft.TextField(
         value=ahora.strftime("%H:%M:%S"), read_only=True, width=130, height=45,
         content_padding=ft.Padding.symmetric(horizontal=12, vertical=8),
         border_radius=8, border_color="#CBD5E1", text_size=13,
+        color="#475569",
+        text_style=ft.TextStyle(color="#475569", weight=ft.FontWeight.W_500),
     )
 
     def obtener_fecha() -> str:
@@ -351,35 +368,82 @@ def abrir_ventana(
         label="Caldera N°", width=220, value=CALDERAS[0],
         options=[ft.dropdown.Option(item) for item in CALDERAS],
         border_radius=8, border_color="#CBD5E1",
+        color="#475569",
+        label_style=ft.TextStyle(color="#64748B"),
     )
     txt_medidor = ft.TextField(
         label="Medidor de agua", suffix=ft.Text("m³", size=13, color="#64748B"),
         keyboard_type=ft.KeyboardType.NUMBER, border_radius=8,
         border_color="#CBD5E1", focused_border_color=COLOR_AGUA,
+        color="#475569",
+        label_style=ft.TextStyle(color="#64748B"),
+        hint_style=ft.TextStyle(color="#64748B"),
     )
     txt_ph = ft.TextField(
         label="pH", hint_text="Rango operativo 9.1 - 9.5", width=180,
         keyboard_type=ft.KeyboardType.NUMBER, border_radius=8,
         border_color="#CBD5E1", focused_border_color=COLOR_ALERTA,
+        color="#475569",
+        label_style=ft.TextStyle(color="#64748B"),
+        hint_style=ft.TextStyle(color="#64748B"),
     )
     txt_soda = ft.TextField(
         label="Consumo soda caustica", suffix=ft.Text("kg", size=13, color="#64748B"),
         keyboard_type=ft.KeyboardType.NUMBER, border_radius=8,
         border_color="#CBD5E1", focused_border_color=COLOR_SODA,
+        color="#475569",
+        label_style=ft.TextStyle(color="#64748B"),
+        hint_style=ft.TextStyle(color="#64748B"),
     )
-    txt_responsable = ft.TextField(
-        label="Responsable", value=nombre_completo,
-        max_length=MAX_NOMBRE, prefix_icon=ft.Icons.PERSON_OUTLINE,
-        border_radius=8, border_color="#CBD5E1",
-        focused_border_color=COLOR_PRIMARIO,
-    )
+    responsable_automatico = (nombre_completo or usuario_logueado or "").strip()
+
     txt_observaciones = ft.TextField(
         label="Observaciones", multiline=True, min_lines=2, max_lines=4,
         max_length=MAX_OBSERVACIONES,
         hint_text="Novedades, desviaciones o acciones realizadas...",
         border_radius=8, border_color="#CBD5E1",
         focused_border_color=COLOR_PRIMARIO,
+        color="#475569",
+        label_style=ft.TextStyle(color="#64748B"),
+        hint_style=ft.TextStyle(color="#64748B"),
     )
+    texto_estado_observaciones = ft.Text("Sin observaciones", size=12, color="#475569")
+
+    def actualizar_estado_observaciones():
+        valor = (txt_observaciones.value or "").strip()
+        texto_estado_observaciones.value = (
+            f"Observación guardada · {len(valor)} caracteres" if valor else "Sin observaciones"
+        )
+        texto_estado_observaciones.color = COLOR_EXITO if valor else "#475569"
+
+    def abrir_observaciones(_):
+        anterior = txt_observaciones.value or ""
+        def cancelar(_):
+            txt_observaciones.value = anterior
+            cerrar_dialogo(dialogo)
+        def guardar(_):
+            txt_observaciones.value = (txt_observaciones.value or "").strip()
+            actualizar_estado_observaciones()
+            cerrar_dialogo(dialogo)
+            page.update()
+        dialogo = ft.AlertDialog(
+            modal=True, bgcolor="white",
+            title=ft.Text("Observaciones", color=COLOR_PRIMARIO, weight=ft.FontWeight.BOLD),
+            content=ft.Container(width=620, bgcolor="white", content=txt_observaciones),
+            actions=[
+                ft.OutlinedButton("Cancelar", on_click=cancelar),
+                ft.ElevatedButton("Guardar observación", icon=ft.Icons.SAVE_OUTLINED,
+                                  bgcolor=COLOR_PRIMARIO, color="white", on_click=guardar),
+            ], actions_alignment=ft.MainAxisAlignment.END,
+        )
+        abrir_dialogo(dialogo)
+
+    btn_observaciones = ft.OutlinedButton(
+        "Observaciones", icon=ft.Icons.NOTES_ROUNDED, on_click=abrir_observaciones,
+        style=ft.ButtonStyle(color=COLOR_PRIMARIO, side=ft.BorderSide(1, COLOR_PRIMARIO),
+                             shape=ft.RoundedRectangleBorder(radius=9)),
+    )
+
     txt_error = ft.Text("", visible=False, color=COLOR_ERROR, size=12,
                         weight=ft.FontWeight.BOLD)
 
@@ -456,11 +520,12 @@ def abrir_ventana(
             ("Medidor de agua", f"{registro.medidor_agua} m3"),
             ("pH", str(registro.ph)),
             ("Soda caustica", f"{registro.consumo_soda} kg"),
-            ("Responsable", registro.responsable),
-            ("Usuario", registro.usuario_registro),
+            ("Usuario responsable", registro.usuario_registro),
+            ("Observaciones", registro.observaciones or "Sin observaciones"),
         ]
         dialogo = ft.AlertDialog(
-            modal=True,
+            modal=True, bgcolor="white",
+            shape=ft.RoundedRectangleBorder(radius=14),
             title=ft.Text("Detalle del registro", color=COLOR_PRIMARIO,
                           weight=ft.FontWeight.BOLD),
             content=ft.Container(
@@ -482,6 +547,25 @@ def abrir_ventana(
         )
         abrir_dialogo(dialogo)
 
+    def editar_registro(registro: LecturaRegistro):
+        nonlocal id_registro_en_edicion, fecha_fijada, hora_fijada
+        id_registro_en_edicion = registro.id_temporal
+        fecha_fijada = registro.fecha
+        hora_fijada = None
+        ahora_edicion = datetime.datetime.now()
+        txt_fecha.value = registro.fecha
+        txt_hora.value = ahora_edicion.strftime("%H:%M:%S")
+        dd_caldera.value = registro.caldera
+        txt_medidor.value = str(registro.medidor_agua)
+        txt_ph.value = str(registro.ph)
+        txt_soda.value = str(registro.consumo_soda)
+        txt_observaciones.value = registro.observaciones
+        actualizar_estado_observaciones()
+        btn_agregar.text = "Actualizar registro pendiente"
+        btn_agregar.icon = ft.Icons.SAVE_AS_OUTLINED
+        btn_actualizar_ahora.visible = True
+        page.update()
+
     def actualizar_tabla():
         contenedor_filas.controls.clear()
         for registro in sorted(
@@ -495,22 +579,25 @@ def abrir_ventana(
                     bgcolor="white", border_radius=8,
                     border=ft.Border.all(1, COLOR_BORDE),
                     content=ft.Row([
-                        ft.Container(ft.Text(f"{registro.fecha}\n{registro.hora}", size=11), expand=2),
-                        ft.Container(ft.Text(registro.caldera, weight=ft.FontWeight.BOLD), expand=2),
-                        ft.Container(ft.Text(str(registro.medidor_agua)), expand=1),
+                        ft.Container(ft.Text(f"{registro.fecha}\n{registro.hora}", size=11, color="#475569"), expand=2),
+                        ft.Container(ft.Text(registro.caldera, weight=ft.FontWeight.BOLD, color="#475569"), expand=2),
+                        ft.Container(ft.Text(str(registro.medidor_agua), color="#475569"), expand=1),
                         ft.Container(ft.Text(
                             str(registro.ph),
                             color=COLOR_ERROR if desviada else COLOR_EXITO,
                             weight=ft.FontWeight.BOLD,
                         ), expand=1),
-                        ft.Container(ft.Text(f"{registro.consumo_soda} kg"), expand=1),
-                        ft.Container(ft.Text(registro.responsable, size=11), expand=2),
-                        ft.Container(ft.Text(registro.usuario_registro, size=11), expand=2),
+                        ft.Container(ft.Text(f"{registro.consumo_soda} kg", color="#475569"), expand=1),
+                        ft.Container(ft.Text(registro.usuario_registro, size=11, color="#475569"), expand=2),
                         ft.Container(ft.Row([
                             ft.IconButton(
                                 ft.Icons.VISIBILITY_ROUNDED, tooltip="Ver",
                                 icon_color=COLOR_AGUA,
                                 on_click=lambda _, r=registro: ver_registro(r),
+                            ),
+                            ft.IconButton(
+                                ft.Icons.EDIT_OUTLINED, tooltip="Editar", icon_color=COLOR_ALERTA,
+                                on_click=lambda _, r=registro: editar_registro(r),
                             ),
                             ft.IconButton(
                                 ft.Icons.DELETE_OUTLINE_ROUNDED, tooltip="Eliminar",
@@ -529,21 +616,28 @@ def abrir_ventana(
             btn_enviar.update()
 
     def agregar_registro_confirmado(registro: LecturaRegistro):
-        clave = (registro.fecha, registro.hora, registro.caldera, registro.usuario_registro)
-        if any(
-            (r.fecha, r.hora, r.caldera, r.usuario_registro) == clave
-            for r in registros_pendientes
-        ):
-            snackbar("Ya existe un pendiente con la misma fecha, hora, caldera y usuario.", COLOR_ERROR)
-            return
-        registros_pendientes.append(registro)
-        txt_medidor.value = ""
-        txt_ph.value = ""
-        txt_soda.value = ""
+        nonlocal id_registro_en_edicion
+        if id_registro_en_edicion is None:
+            registros_pendientes.append(registro)
+            mensaje = "Lectura agregada a la tabla de pendientes."
+        else:
+            indice = next((i for i, r in enumerate(registros_pendientes)
+                           if r.id_temporal == id_registro_en_edicion), None)
+            if indice is None:
+                snackbar("El registro pendiente ya no está disponible.", COLOR_ERROR)
+                return
+            registros_pendientes[indice] = registro
+            mensaje = "Registro pendiente actualizado correctamente."
+        id_registro_en_edicion = None
+        txt_medidor.value = txt_ph.value = txt_soda.value = ""
+        txt_observaciones.value = ""
+        actualizar_estado_observaciones()
+        btn_agregar.text = "Agregar registro a la tabla"
+        btn_agregar.icon = ft.Icons.ADD_ROUNDED
         txt_error.visible = False
         actualizar_tabla()
         page.update()
-        snackbar("Lectura agregada a la tabla de pendientes.", COLOR_ALERTA)
+        snackbar(mensaje, COLOR_ALERTA)
 
     def registrar_lectura(_):
         try:
@@ -554,8 +648,10 @@ def abrir_ventana(
                 txt_medidor.value,
                 txt_ph.value,
                 txt_soda.value,
-                txt_responsable.value,
+                responsable_automatico,
                 usuario_logueado,
+                (txt_observaciones.value or "").strip(),
+                id_registro_en_edicion,
             )
         except ValueError as ex:
             txt_error.value = str(ex)
@@ -573,6 +669,7 @@ def abrir_ventana(
             title=ft.Text("pH fuera del rango operativo", color=COLOR_ERROR,
                           weight=ft.FontWeight.BOLD),
             content=ft.Container(
+                bgcolor="white",
                 width=450,
                 content=ft.Column([
                     ft.Text(f"Valor registrado: {registro.ph}"),
@@ -640,9 +737,8 @@ def abrir_ventana(
         def enviar(_):
             boton_confirmar.disabled = True
             dialogo.update()
-            observaciones = (txt_observaciones.value or "").strip()
             try:
-                ids = insertar_registros_bd(registros_pendientes.copy(), observaciones)
+                ids = insertar_registros_bd(registros_pendientes.copy(), "")
             except ValueError as ex:
                 cerrar_dialogo(dialogo)
                 snackbar(str(ex), COLOR_ERROR)
@@ -729,8 +825,8 @@ def abrir_ventana(
 
     def animar_marquee():
         texto = (
-            f" {CODIGO_FORMULARIO} {TITULO_FORMULARIO} | {SUBTITULO_FORMULARIO} | "
-            f"RESPONSABLE: {nombre_completo} | USUARIO: {usuario_logueado} | "
+            f" {CODIGO_FORMULARIO} {TITULO_FORMULARIO} | "
+            f"RESPONSABLE: {nombre_completo or usuario_logueado} | "
             "CRYSTAL S.A.S |     "
         ) * 10
         while formulario_activo:
@@ -816,27 +912,24 @@ def abrir_ventana(
         content=ft.Column([
             ft.Row([
                 ft.Column([
-                    ft.Text("Fecha de medicion", weight=ft.FontWeight.BOLD, size=13),
+                    ft.Text("Fecha de medición", weight=ft.FontWeight.BOLD, size=13, color="#475569"),
                     ft.Row([txt_fecha, ft.IconButton(
                         ft.Icons.CALENDAR_TODAY_ROUNDED,
                         icon_color=COLOR_PRIMARIO,
+                        tooltip="Seleccionar fecha",
                         on_click=lambda _: abrir_dialogo(date_picker),
-                    )]),
+                    )], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=5),
                 ft.Column([
-                    ft.Text("Hora de medicion", weight=ft.FontWeight.BOLD, size=13),
+                    ft.Text("Hora de medición", weight=ft.FontWeight.BOLD, size=13, color="#475569"),
                     ft.Row([txt_hora, ft.IconButton(
                         ft.Icons.ACCESS_TIME_ROUNDED,
                         icon_color=COLOR_PRIMARIO,
+                        tooltip="Seleccionar hora",
                         on_click=lambda _: abrir_dialogo(time_picker),
-                    )]),
+                    )], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 ], spacing=5),
-                dd_caldera,
-                ft.TextField(
-                    label="Usuario que registra", value=usuario_logueado,
-                    read_only=True, width=240, prefix_icon=ft.Icons.BADGE_OUTLINED,
-                ),
-            ], spacing=22, vertical_alignment=ft.CrossAxisAlignment.END, wrap=True),
+            ], spacing=22, vertical_alignment=ft.CrossAxisAlignment.END),
             ft.Row([btn_actualizar_ahora], alignment=ft.MainAxisAlignment.END),
         ], spacing=5),
     )
@@ -854,9 +947,11 @@ def abrir_ventana(
                 "Capture una lectura. No existen turnos, carrusel ni registros por turno.",
                 color="#64748B", size=13,
             ),
-            ft.Row([txt_medidor, txt_ph, txt_soda, txt_responsable],
-                   spacing=12, run_spacing=12, wrap=True),
-            txt_observaciones,
+            ft.Row([dd_caldera, txt_medidor, txt_ph, txt_soda],
+                   spacing=12, run_spacing=12, wrap=True,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([btn_observaciones, texto_estado_observaciones], spacing=12,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True),
             txt_error,
             ft.Row([btn_agregar], alignment=ft.MainAxisAlignment.END),
         ], spacing=12),
@@ -877,8 +972,6 @@ def abrir_ventana(
                                  color=COLOR_PRIMARIO, size=11), expand=1),
             ft.Container(ft.Text("SODA", weight=ft.FontWeight.BOLD,
                                  color=COLOR_PRIMARIO, size=11), expand=1),
-            ft.Container(ft.Text("RESPONSABLE", weight=ft.FontWeight.BOLD,
-                                 color=COLOR_PRIMARIO, size=11), expand=2),
             ft.Container(ft.Text("USUARIO", weight=ft.FontWeight.BOLD,
                                  color=COLOR_PRIMARIO, size=11), expand=2),
             ft.Container(ft.Text("ACCIONES", weight=ft.FontWeight.BOLD,
@@ -911,7 +1004,7 @@ def abrir_ventana(
         content=ft.Row([
             ft.Icon(ft.Icons.INFO_OUTLINE_ROUNDED, color=COLOR_PRIMARIO),
             ft.Text(
-                "Cada fila conserva la fecha, la hora, la caldera, el responsable y "
+                "Cada fila conserva la fecha, la hora, la caldera y "
                 "el usuario autenticado. El pH esperado es 9.1 a 9.5.",
                 color=COLOR_PRIMARIO, size=13, expand=True,
             ),
@@ -930,6 +1023,7 @@ def abrir_ventana(
     ))
 
     pagina_lista = True
+    actualizar_estado_observaciones()
     actualizar_tabla()
     recargar_historico()
     page.update()
